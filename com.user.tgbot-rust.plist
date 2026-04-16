@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.tgbot-rust</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/PATH/TO/tgbot/rust/target/release/tgbot</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/PATH/TO/tgbot/rust</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/PATH/TO/tgbot/rust/tgbot.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/PATH/TO/tgbot/rust/tgbot-error.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
