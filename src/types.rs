@@ -12,6 +12,7 @@ pub enum Mode {
 }
 
 pub type UserModes = Arc<DashMap<UserId, Mode>>;
+pub type PendingDownloads = Arc<DashMap<UserId, String>>;
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]

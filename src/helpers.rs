@@ -124,3 +124,23 @@ pub fn ytdlp_auth_args(url: &str, config: &Config) -> Vec<String> {
     }
     args
 }
+
+/// Get video duration in seconds using yt-dlp extract_info (no download).
+pub async fn get_video_duration(url: &str, config: &Config) -> Option<f64> {
+    let mut cmd = AsyncCommand::new("yt-dlp");
+    cmd.args(["--print", "duration", "--no-download", "--no-warnings", "--quiet"]);
+    for arg in ytdlp_auth_args(url, config) {
+        cmd.arg(arg);
+    }
+    cmd.arg(url);
+    cmd.kill_on_drop(true);
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await;
+    match result {
+        Ok(Ok(output)) if output.status.success() => {
+            let s = String::from_utf8_lossy(&output.stdout);
+            s.trim().parse::<f64>().ok()
+        }
+        _ => None,
+    }
+}

@@ -12,7 +12,7 @@ mod helpers;
 mod types;
 
 use config::Config;
-use types::{Cmd, UserModes};
+use types::{Cmd, PendingDownloads, UserModes};
 
 #[tokio::main]
 async fn main() {
@@ -36,19 +36,25 @@ async fn main() {
     }
 
     let modes: UserModes = Arc::new(DashMap::new());
+    let pending: PendingDownloads = Arc::new(DashMap::new());
 
-    let handler = dptree::entry().branch(
-        Update::filter_message()
-            .branch(
-                dptree::entry()
-                    .filter_command::<Cmd>()
-                    .endpoint(handlers::handle_command),
-            )
-            .branch(dptree::entry().endpoint(handlers::handle_message)),
-    );
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_message()
+                .branch(
+                    dptree::entry()
+                        .filter_command::<Cmd>()
+                        .endpoint(handlers::handle_command),
+                )
+                .branch(dptree::entry().endpoint(handlers::handle_message)),
+        )
+        .branch(
+            Update::filter_callback_query()
+                .endpoint(handlers::handle_callback),
+        );
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![modes, config])
+        .dependencies(dptree::deps![modes, pending, config])
         .default_handler(|upd| async move {
             warn!("Unhandled update: {:?}", upd.id);
         })
