@@ -49,34 +49,37 @@ cargo run
 
 ## Run as background service (macOS)
 
-The quickest way — builds the binary, fills in paths, and starts the service:
+### Install (first time)
+
+Builds the binary, registers the launchd service, and starts the bot:
 
 ```bash
-./install-service.sh
+./install-service.sh install
 ```
 
-### Stop
+### Update (after pulling changes)
+
+Rebuilds and restarts the running service in one step:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.user.tgbot-rust.plist
+./install-service.sh update
 ```
 
-### Restart
+### Uninstall
+
+Stops the service and removes the plist:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.user.tgbot-rust.plist
-launchctl load ~/Library/LaunchAgents/com.user.tgbot-rust.plist
+./install-service.sh uninstall
 ```
 
-### Check status
+### Status
 
 ```bash
-launchctl list | grep tgbot
+./install-service.sh status
 ```
 
 The service auto-starts on login and auto-restarts on crash (with a 10s cooldown). Logs are written to `tgbot.log` and `tgbot-error.log` in the repo directory.
-
-After rebuilding (`cargo build --release`), restart the service to pick up changes.
 
 ## Bot usage
 
