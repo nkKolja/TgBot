@@ -93,7 +93,8 @@ impl Config {
 }
 
 fn which(name: &str) -> PathBuf {
-    std::process::Command::new("which")
+    // Try the system `which` first (works when PATH is correct).
+    if let Some(p) = std::process::Command::new("which")
         .arg(name)
         .output()
         .ok()
@@ -106,5 +107,24 @@ fn which(name: &str) -> PathBuf {
                 None
             }
         })
-        .unwrap_or_else(|| PathBuf::from(name))
+    {
+        return p;
+    }
+
+    // Fallback: probe common directories (launchd has a minimal PATH).
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates: &[&str] = &[
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        &format!("{home}/.local/bin"),
+    ];
+    for dir in candidates {
+        let p = PathBuf::from(dir).join(name);
+        if p.exists() {
+            return p;
+        }
+    }
+
+    PathBuf::from(name)
 }
