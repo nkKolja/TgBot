@@ -7,6 +7,7 @@ edition = "2021"
 teloxide = { version = "0.13", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 dashmap = "6"
+dirs = "6"
 rand = "0.8"
 tempfile = "3"
 tracing = "0.1"

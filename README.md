@@ -2,7 +2,7 @@
 
 Telegram bot that downloads videos and audio from links and sends them back in the chat.
 
-Supported platforms: YouTube, Facebook, Instagram, TikTok, Twitter/X, Reddit, LinkedIn.
+Supported platforms: YouTube, Facebook, Instagram, TikTok, Twitter/X, Reddit, LinkedIn, and 1800+ more via yt-dlp can be enabled.
 
 ## Requirements
 
@@ -23,7 +23,7 @@ Edit `.env` and set your bot token:
 TELEGRAM_BOT_TOKEN=your_token_here
 ```
 
-That's it. `ffmpeg` and `ffprobe` are auto-detected from your PATH. If you need to override:
+`ffmpeg` and `ffprobe` are auto-detected from your PATH. To override:
 
 ```
 FFMPEG_BIN=/usr/local/bin/ffmpeg
@@ -49,20 +49,22 @@ cargo run
 
 ## Run as background service (macOS)
 
+Service management is built into the binary. Run commands with `cargo run --`:
+
 ### Install (first time)
 
-Builds the binary, registers the launchd service, and starts the bot:
+Builds a release binary, registers the launchd service, and starts the bot:
 
 ```bash
-./install-service.sh install
+cargo run -- service install
 ```
 
 ### Update (after pulling changes)
 
-Rebuilds and restarts the running service in one step:
+Rebuilds and restarts the running service:
 
 ```bash
-./install-service.sh update
+cargo run -- service update
 ```
 
 ### Uninstall
@@ -70,13 +72,13 @@ Rebuilds and restarts the running service in one step:
 Stops the service and removes the plist:
 
 ```bash
-./install-service.sh uninstall
+cargo run -- service uninstall
 ```
 
 ### Status
 
 ```bash
-./install-service.sh status
+cargo run -- service status
 ```
 
 The service auto-starts on login and auto-restarts on crash (with a 10s cooldown). Logs are written to `tgbot.log` and `tgbot-error.log` in the repo directory.

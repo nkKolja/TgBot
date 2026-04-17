@@ -9,6 +9,7 @@ mod config;
 mod download;
 mod handlers;
 mod helpers;
+mod service;
 mod types;
 
 use config::Config;
@@ -16,6 +17,13 @@ use types::{Cmd, PendingDownloads, UserModes};
 
 #[tokio::main]
 async fn main() {
+    // Handle `tgbot service <subcommand>` before starting the bot.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("service") {
+        let code = service::run(&args[2..]);
+        std::process::exit(if code == std::process::ExitCode::SUCCESS { 0 } else { 1 });
+    }
+
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
