@@ -74,18 +74,20 @@ pub async fn download_and_send_video(
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tmp = TempDir::new()?;
-    let video_out = tmp.path().join("video.mp4");
-    let video_out_str = video_out.to_string_lossy().to_string();
-    let ffmpeg_str = config.ffmpeg_bin.to_string_lossy().to_string();
+    let ffmpeg_dir = config.ffmpeg_bin.parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| config.ffmpeg_bin.to_string_lossy().to_string());
 
     // --- Preferred download ---
     info!("Attempting preferred video download: {url}");
+    let preferred_out = tmp.path().join("video.%(ext)s");
+    let preferred_out_str = preferred_out.to_string_lossy().to_string();
     let preferred_result = run_ytdlp(
         &[
-            "--ffmpeg-location", &ffmpeg_str,
+            "--ffmpeg-location", &ffmpeg_dir,
             "-f", "bestvideo[filesize<50M][ext=mp4]+bestaudio[filesize<10M]/best[ext=mp4]/best",
             "--max-filesize", "50M",
-            "-o", &video_out_str,
+            "-o", &preferred_out_str,
             "--merge-output-format", "mp4",
             "--postprocessor-args", "-c:v libx264 -preset fast -crf 23 -c:a aac -movflags +faststart",
             "--no-warnings", "--no-progress",
@@ -96,11 +98,13 @@ pub async fn download_and_send_video(
     )
     .await;
 
-    if preferred_result.is_ok() && video_out.exists() && video_out.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-        info!("Preferred download succeeded: {url}");
-        send_video_file(bot, msg, &video_out, config).await?;
-        info!("Sent video: {url}");
-        return Ok(());
+    if let Some(video_path) = preferred_result.as_ref().ok().and_then(|_| find_prefixed_file(tmp.path(), "video.")) {
+        if video_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            info!("Preferred download succeeded: {url}");
+            send_video_file(bot, msg, &video_path, config).await?;
+            info!("Sent video: {url}");
+            return Ok(());
+        }
     }
 
     // --- Fallback download ---
@@ -115,7 +119,7 @@ pub async fn download_and_send_video(
 
     run_ytdlp(
         &[
-            "--ffmpeg-location", &ffmpeg_str,
+            "--ffmpeg-location", &ffmpeg_dir,
             "-f", "bestvideo+bestaudio",
             "-o", &fallback_out_str,
             "--remux-video", "mp4",
@@ -131,6 +135,7 @@ pub async fn download_and_send_video(
         .ok_or("Fallback file was not created")?;
 
     // --- Re-encode with ffmpeg ---
+    let reencoded_out = tmp.path().join("reencoded.mp4");
     info!("Re-encoding fallback video: {url}");
     let reencode_status = AsyncCommand::new(&config.ffmpeg_bin)
         .args([
@@ -148,7 +153,7 @@ pub async fn download_and_send_video(
             "-movflags", "+faststart",
             "-f", "mp4",
         ])
-        .arg(&video_out)
+        .arg(&reencoded_out)
         .output()
         .await?;
 
@@ -157,11 +162,11 @@ pub async fn download_and_send_video(
         return Err(format!("ffmpeg re-encode failed: {stderr}").into());
     }
 
-    if !video_out.exists() || video_out.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+    if !reencoded_out.exists() || reencoded_out.metadata().map(|m| m.len() == 0).unwrap_or(true) {
         return Err("Re-encoded file is empty".into());
     }
 
-    send_video_file(bot, msg, &video_out, config).await?;
+    send_video_file(bot, msg, &reencoded_out, config).await?;
     info!("Sent fallback/re-encoded video: {url}");
     Ok(())
 }
