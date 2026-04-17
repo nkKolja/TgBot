@@ -154,7 +154,7 @@ pub fn ytdlp_auth_args(url: &str, config: &Config) -> Vec<String> {
 
 /// Get video duration in seconds using yt-dlp extract_info (no download).
 pub async fn get_video_duration(url: &str, config: &Config) -> Option<f64> {
-    let mut cmd = AsyncCommand::new("yt-dlp");
+    let mut cmd = AsyncCommand::new(&config.ytdlp_bin);
     cmd.args(["--print", "duration", "--no-download", "--no-warnings", "--quiet"]);
     for arg in ytdlp_auth_args(url, config) {
         cmd.arg(arg);

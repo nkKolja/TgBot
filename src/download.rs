@@ -20,8 +20,10 @@ async fn send_video_file(
 
     let mut req = bot
         .send_video(msg.chat.id, InputFile::file(path.to_path_buf()))
-        .reply_parameters(ReplyParameters::new(msg.id))
         .supports_streaming(true);
+    if !msg.chat.is_private() {
+        req = req.reply_parameters(ReplyParameters::new(msg.id));
+    }
     if let Some(w) = w {
         req = req.width(w);
     }
@@ -37,7 +39,7 @@ async fn run_ytdlp(
     url: &str,
     config: &Config,
     timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mut cmd = AsyncCommand::new(&config.ytdlp_bin);
     cmd.args(args);
     for arg in ytdlp_auth_args(url, config) {
@@ -51,18 +53,17 @@ async fn run_ytdlp(
 
     match result {
         Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
                 let detail = if !stderr.is_empty() { &stderr } else { &stdout };
                 return Err(format!("yt-dlp failed (exit {}): {detail}", output.status).into());
             }
-            Ok(())
+            Ok(format!("{stderr}\n{stdout}"))
         }
         Ok(Err(e)) => Err(format!("yt-dlp io error: {e}").into()),
         Err(_) => {
-            // timeout — kill_on_drop handles cleanup when child is dropped here
-            Err(format!("yt-dlp timed out after {}s", timeout.as_secs()).into())
+            Err(format!("yt-dlp cancelled: download exceeded {}s limit", timeout.as_secs()).into())
         }
     }
 }
@@ -90,7 +91,7 @@ pub async fn download_and_send_video(
             "-o", &preferred_out_str,
             "--merge-output-format", "mp4",
             "--postprocessor-args", "-c:v libx264 -preset fast -crf 23 -c:a aac -movflags +faststart",
-            "--no-warnings", "--no-progress",
+            "--no-progress",
         ],
         url,
         config,
@@ -98,20 +99,26 @@ pub async fn download_and_send_video(
     )
     .await;
 
-    if let Some(video_path) = preferred_result.as_ref().ok().and_then(|_| find_prefixed_file(tmp.path(), "video.")) {
-        if video_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-            info!("Preferred download succeeded: {url}");
-            send_video_file(bot, msg, &video_path, config).await?;
-            info!("Sent video: {url}");
-            return Ok(());
+    if let Ok(output) = &preferred_result {
+        let aborted = output.contains("Aborting") || output.contains("larger than max-filesize");
+        if !aborted {
+            if let Some(video_path) = find_prefixed_file(tmp.path(), "video.") {
+                let file_len = video_path.metadata().map(|m| m.len()).unwrap_or(0);
+                if file_len > 1024 {
+                    info!("Preferred download succeeded ({file_len} bytes): {url}");
+                    send_video_file(bot, msg, &video_path, config).await?;
+                    info!("Sent video: {url}");
+                    return Ok(());
+                }
+            }
         }
     }
 
     // --- Fallback download ---
-    if let Err(e) = &preferred_result {
-        warn!("Preferred download failed: {e}");
-    } else {
-        warn!("Preferred download produced no output file");
+    match &preferred_result {
+        Err(e) => warn!("Preferred download failed: {e}"),
+        Ok(output) if output.contains("Aborting") => warn!("Preferred download aborted (file too large)"),
+        _ => warn!("Preferred download produced no usable file"),
     }
     warn!("Trying fallback download: {url}");
     let fallback_out = tmp.path().join("fallback_video");
@@ -182,10 +189,13 @@ pub async fn download_and_send_audio(
     let audio_out_str = audio_out.to_string_lossy().to_string();
 
     info!("Downloading audio: {url}");
+    let title_file = tmp.path().join("title.txt");
+    let title_file_str = title_file.to_string_lossy().to_string();
     run_ytdlp(
         &[
             "-f", "139/140/bestaudio[abr<=50]/bestaudio",
             "-o", &audio_out_str,
+            "--print-to-file", "title", &title_file_str,
             "--no-warnings", "--no-progress",
         ],
         url,
@@ -194,12 +204,35 @@ pub async fn download_and_send_audio(
     )
     .await?;
 
+    let title = std::fs::read_to_string(&title_file).unwrap_or_default();
+    let title = title.trim();
+
     let audio_path = find_prefixed_file(tmp.path(), "audio.")
         .ok_or("Audio file was not created")?;
 
-    bot.send_audio(msg.chat.id, InputFile::file(audio_path))
-        .reply_parameters(ReplyParameters::new(msg.id))
-        .await?;
+    // Rename file to include the title so desktop Telegram shows it
+    let ext = audio_path.extension().and_then(|e| e.to_str()).unwrap_or("m4a");
+    let named_path = if !title.is_empty() {
+        let safe_title: String = title.chars()
+            .map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c })
+            .collect();
+        let dest = tmp.path().join(format!("{safe_title}.{ext}"));
+        std::fs::rename(&audio_path, &dest).unwrap_or(());
+        dest
+    } else {
+        audio_path
+    };
+
+    let mut req = bot.send_audio(msg.chat.id, InputFile::file(&named_path));
+    if !title.is_empty() {
+        req = req.title(title);
+    }
+    if msg.chat.is_private() {
+        // Don't quote in private chats
+    } else {
+        req = req.reply_parameters(ReplyParameters::new(msg.id));
+    }
+    req.await?;
 
     info!("Sent audio: {url}");
     Ok(())
