@@ -1,9 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use teloxide::prelude::*;
 use teloxide::utils::command::BotCommands;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
+use yt_dlp::Downloader;
 
 mod config;
 mod download;
@@ -11,8 +13,7 @@ mod handlers;
 mod helpers;
 mod types;
 
-use config::Config;
-use types::{Cmd, PendingDownloads, UserModes};
+use types::{Cmd, PendingDownloads, SharedDownloader, UserModes};
 
 #[tokio::main]
 async fn main() {
@@ -27,7 +28,20 @@ async fn main() {
 
     let token = std::env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set");
 
-    let config = Arc::new(Config::from_env());
+    let config = config::Config::from_env();
+
+    // Initialize yt-dlp downloader (auto-downloads yt-dlp + ffmpeg binaries)
+    info!("Initializing yt-dlp downloader...");
+    let downloader: SharedDownloader = Arc::new(
+        Downloader::with_new_binaries(PathBuf::from("libs"), PathBuf::from("output"))
+            .await
+            .expect("Failed to install yt-dlp/ffmpeg binaries")
+            .with_timeout(config.download_timeout)
+            .build()
+            .await
+            .expect("Failed to build downloader"),
+    );
+    info!("yt-dlp downloader ready");
 
     let bot = Bot::new(&token);
 
@@ -54,7 +68,7 @@ async fn main() {
         );
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![modes, pending, config])
+        .dependencies(dptree::deps![modes, pending, downloader])
         .default_handler(|upd| async move {
             warn!("Unhandled update: {:?}", upd.id);
         })

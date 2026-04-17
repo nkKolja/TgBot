@@ -3,6 +3,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use teloxide::types::UserId;
 use teloxide::utils::command::BotCommands;
+use yt_dlp::Downloader;
 
 #[derive(Clone, Copy, Default, Debug)]
 pub enum Mode {
@@ -13,6 +14,7 @@ pub enum Mode {
 
 pub type UserModes = Arc<DashMap<UserId, Mode>>;
 pub type PendingDownloads = Arc<DashMap<UserId, String>>;
+pub type SharedDownloader = Arc<Downloader>;
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]

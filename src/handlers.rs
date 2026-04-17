@@ -1,13 +1,10 @@
-use std::sync::Arc;
-
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 use tracing::{error, info};
 
-use crate::config::Config;
-use crate::download::{download_and_send_audio, download_and_send_video};
-use crate::helpers::{capitalize_first, get_video_duration, is_supported_url, random_greeting};
-use crate::types::{Cmd, Mode, PendingDownloads, UserModes};
+use crate::download::{download_and_send_audio, download_and_send_video, get_video_duration};
+use crate::helpers::{capitalize_first, is_supported_url, random_greeting};
+use crate::types::{Cmd, Mode, PendingDownloads, SharedDownloader, UserModes};
 
 pub async fn handle_command(
     bot: Bot,
@@ -50,7 +47,7 @@ pub async fn handle_message(
     msg: Message,
     modes: UserModes,
     pending: PendingDownloads,
-    config: Arc<Config>,
+    downloader: SharedDownloader,
 ) -> ResponseResult<()> {
     let text = msg.text().unwrap_or("").trim();
     let is_private = msg.chat.is_private();
@@ -76,7 +73,7 @@ pub async fn handle_message(
 
     // Duration check: when in Video mode, warn if video > 5 minutes
     if matches!(mode, Mode::Video) {
-        if let Some(duration) = get_video_duration(text, &config).await {
+        if let Some(duration) = get_video_duration(text, &downloader).await {
             if duration > 300.0 {
                 let mins = (duration / 60.0).ceil() as u64;
                 pending.insert(uid, text.to_owned());
@@ -102,8 +99,8 @@ pub async fn handle_message(
     }
 
     let result = match mode {
-        Mode::Video => download_and_send_video(&bot, &msg, text, &config).await,
-        Mode::Audio => download_and_send_audio(&bot, &msg, text, &config).await,
+        Mode::Video => download_and_send_video(&bot, &msg, text, &downloader).await,
+        Mode::Audio => download_and_send_audio(&bot, &msg, text, &downloader).await,
     };
 
     if let Err(e) = result {
@@ -121,7 +118,7 @@ pub async fn handle_callback(
     bot: Bot,
     q: CallbackQuery,
     pending: PendingDownloads,
-    config: Arc<Config>,
+    downloader: SharedDownloader,
 ) -> ResponseResult<()> {
     let data = match q.data.as_deref() {
         Some(d) => d,
@@ -155,7 +152,6 @@ pub async fn handle_callback(
         }
     }
 
-    // Determine the original message to reply to (find the message the prompt replied to, or use the prompt itself)
     let reply_msg = q
         .message
         .as_ref()
@@ -170,7 +166,7 @@ pub async fn handle_callback(
         "long_audio" => {
             bot.send_message(chat_id, "Преузимам као аудио...").await?;
             if let Some(m) = &reply_msg {
-                download_and_send_audio(&bot, m, &url, &config).await
+                download_and_send_audio(&bot, m, &url, &downloader).await
             } else {
                 return Ok(());
             }
@@ -178,7 +174,7 @@ pub async fn handle_callback(
         "long_continue" => {
             bot.send_message(chat_id, "Преузимам као видео...").await?;
             if let Some(m) = &reply_msg {
-                download_and_send_video(&bot, m, &url, &config).await
+                download_and_send_video(&bot, m, &url, &downloader).await
             } else {
                 return Ok(());
             }
@@ -191,6 +187,5 @@ pub async fn handle_callback(
         bot.send_message(chat_id, format!("Error: {e}")).await?;
     }
 
-    // Mode remains Video — no change needed
     Ok(())
 }

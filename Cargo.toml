@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+yt-dlp = "2.7.2"
 teloxide = { version = "0.13", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 dashmap = "6"
@@ -12,3 +13,8 @@ tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
+
+# lofty 0.23.2 and 0.23.3 are yanked on crates.io but yt-dlp requires ^0.23.2.
+# Pulling from git at the 0.23.2 tag bypasses the yank.
+[patch.crates-io]
+lofty = { git = "https://github.com/Serial-ATA/lofty-rs", tag = "0.23.2" }
