@@ -23,9 +23,10 @@ Edit `.env` and set your bot token:
 TELEGRAM_BOT_TOKEN=your_token_here
 ```
 
-`ffmpeg` and `ffprobe` are auto-detected from your PATH. To override:
+`yt-dlp`, `ffmpeg`, and `ffprobe` are auto-detected from PATH and common locations (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`). To override:
 
 ```
+YTDLP_BIN=/opt/homebrew/bin/yt-dlp
 FFMPEG_BIN=/usr/local/bin/ffmpeg
 FFPROBE_BIN=/usr/local/bin/ffprobe
 ```
@@ -61,7 +62,8 @@ cargo run -- service install
 
 ### Update (after pulling changes)
 
-Rebuilds and restarts the running service:
+Updates external tools (yt-dlp, ffmpeg), rebuilds, and restarts the service.
+Also works without the service installed — just updates tools and rebuilds:
 
 ```bash
 cargo run -- service update
@@ -89,6 +91,8 @@ The service auto-starts on login and auto-restarts on crash (with a 10s cooldown
 - `/video` — switch to video mode (default)
 - `/audio` — switch to audio mode
 - Send a link — bot downloads and sends back the video or audio
+- For long videos the bot asks whether to download as audio or continue as video
+- Downloads are capped at 30s to avoid wasting time on files that exceed Telegram's size limit
 
 In groups, the bot only responds to supported links and stays silent on errors. Make sure **Group Privacy** is turned off in BotFather (`Bot Settings → Group Privacy → Turn off`).
 
@@ -97,7 +101,9 @@ In groups, the bot only responds to supported links and stays silent on errors. 
 | Variable | Default | Description |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | *required* | Bot token from BotFather |
+| `YTDLP_BIN` | auto-detected | Path to yt-dlp binary |
 | `FFMPEG_BIN` | auto-detected | Path to ffmpeg binary |
 | `FFPROBE_BIN` | auto-detected | Path to ffprobe binary |
-| `DOWNLOAD_TIMEOUT_SECS` | `30` | Max seconds for a yt-dlp download |
+| `DOWNLOAD_TIMEOUT_SECS` | `30` | Max seconds for a single download. Downloads exceeding this are cancelled to keep the bot responsive. |
+| `LONG_VIDEO_SECS` | `300` | Videos longer than this (in seconds) trigger an audio/video choice prompt |
 | `RUST_LOG` | `tgbot=info` | Log level filter |

@@ -77,7 +77,7 @@ pub async fn handle_message(
     // Duration check: when in Video mode, warn if video > 5 minutes
     if matches!(mode, Mode::Video) {
         if let Some(duration) = get_video_duration(text, &config).await {
-            if duration > 300.0 {
+            if duration > config.long_video_secs {
                 let mins = (duration / 60.0).ceil() as u64;
                 pending.insert(uid, text.to_owned());
 

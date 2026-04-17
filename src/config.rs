@@ -67,6 +67,7 @@ pub struct Config {
     pub ffmpeg_bin: PathBuf,
     pub ffprobe_bin: PathBuf,
     pub download_timeout: Duration,
+    pub long_video_secs: f64,
     pub services: Services,
 }
 
@@ -76,6 +77,10 @@ impl Config {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(30);
+        let long_video_secs = std::env::var("LONG_VIDEO_SECS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(300.0);
         Self {
             ytdlp_bin: std::env::var("YTDLP_BIN")
                 .map(PathBuf::from)
@@ -87,6 +92,7 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| which("ffprobe")),
             download_timeout: Duration::from_secs(timeout_secs),
+            long_video_secs,
             services: Services::from_env(),
         }
     }
