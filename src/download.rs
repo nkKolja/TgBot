@@ -53,7 +53,9 @@ async fn run_ytdlp(
         Ok(Ok(output)) => {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("yt-dlp failed: {stderr}").into());
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let detail = if !stderr.is_empty() { &stderr } else { &stdout };
+                return Err(format!("yt-dlp failed (exit {}): {detail}", output.status).into());
             }
             Ok(())
         }
@@ -86,7 +88,7 @@ pub async fn download_and_send_video(
             "-o", &video_out_str,
             "--merge-output-format", "mp4",
             "--postprocessor-args", "-c:v libx264 -preset fast -crf 23 -c:a aac -movflags +faststart",
-            "--quiet", "--no-progress",
+            "--no-warnings", "--no-progress",
         ],
         url,
         config,
@@ -112,7 +114,7 @@ pub async fn download_and_send_video(
             "-f", "bestvideo+bestaudio",
             "-o", &fallback_out_str,
             "--remux-video", "mp4",
-            "--quiet", "--no-progress",
+            "--no-warnings", "--no-progress",
         ],
         url,
         config,
@@ -174,7 +176,7 @@ pub async fn download_and_send_audio(
         &[
             "-f", "139/140/bestaudio[abr<=50]/bestaudio",
             "-o", &audio_out_str,
-            "--quiet", "--no-progress",
+            "--no-warnings", "--no-progress",
         ],
         url,
         config,

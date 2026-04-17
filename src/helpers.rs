@@ -62,6 +62,7 @@ pub fn is_supported_url(text: &str) -> bool {
 }
 
 pub async fn video_dimensions(ffprobe: &Path, path: &Path) -> (Option<u32>, Option<u32>) {
+    // Try ffprobe first, fall back to ffmpeg -i if ffprobe is not available
     let out = AsyncCommand::new(ffprobe)
         .args([
             "-v",
@@ -82,20 +83,46 @@ pub async fn video_dimensions(ffprobe: &Path, path: &Path) -> (Option<u32>, Opti
             let s = String::from_utf8_lossy(&o.stdout);
             let parts: Vec<&str> = s.trim().split(',').collect();
             if parts.len() == 2 {
-                (parts[0].parse().ok(), parts[1].parse().ok())
-            } else {
-                (None, None)
+                return (parts[0].parse().ok(), parts[1].parse().ok());
             }
         }
         Ok(o) => {
             error!("ffprobe error: {}", String::from_utf8_lossy(&o.stderr));
-            (None, None)
         }
-        Err(e) => {
-            error!("ffprobe failed to run: {e}");
-            (None, None)
+        Err(_) => {
+            // ffprobe not found — try ffmpeg -i instead
         }
     }
+
+    // Fallback: parse dimensions from ffmpeg -i stderr
+    let ffmpeg = ffprobe.with_file_name("ffmpeg");
+    let out = AsyncCommand::new(&ffmpeg)
+        .arg("-i")
+        .arg(path)
+        .arg("-hide_banner")
+        .output()
+        .await;
+
+    if let Ok(o) = out {
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        for line in stderr.lines() {
+            if !line.contains("Video:") {
+                continue;
+            }
+            for token in line.split(|c: char| c == ',' || c == ' ' || c == '[') {
+                let token = token.trim();
+                if let Some((w_str, h_str)) = token.split_once('x') {
+                    if let (Ok(w), Ok(h)) = (w_str.parse::<u32>(), h_str.parse::<u32>()) {
+                        if w > 0 && h > 0 && w < 10000 && h < 10000 {
+                            return (Some(w), Some(h));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (None, None)
 }
 
 pub fn find_prefixed_file(dir: &Path, prefix: &str) -> Option<PathBuf> {
