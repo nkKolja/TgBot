@@ -63,6 +63,7 @@ impl Services {
 }
 
 pub struct Config {
+    pub ytdlp_bin: PathBuf,
     pub ffmpeg_bin: PathBuf,
     pub ffprobe_bin: PathBuf,
     pub download_timeout: Duration,
@@ -76,6 +77,9 @@ impl Config {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(30);
         Self {
+            ytdlp_bin: std::env::var("YTDLP_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| which("yt-dlp")),
             ffmpeg_bin: std::env::var("FFMPEG_BIN")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| which("ffmpeg")),

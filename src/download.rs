@@ -38,7 +38,7 @@ async fn run_ytdlp(
     config: &Config,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut cmd = AsyncCommand::new("yt-dlp");
+    let mut cmd = AsyncCommand::new(&config.ytdlp_bin);
     cmd.args(args);
     for arg in ytdlp_auth_args(url, config) {
         cmd.arg(arg);
@@ -104,7 +104,12 @@ pub async fn download_and_send_video(
     }
 
     // --- Fallback download ---
-    warn!("Preferred download failed, trying fallback: {url}");
+    if let Err(e) = &preferred_result {
+        warn!("Preferred download failed: {e}");
+    } else {
+        warn!("Preferred download produced no output file");
+    }
+    warn!("Trying fallback download: {url}");
     let fallback_out = tmp.path().join("fallback_video");
     let fallback_out_str = fallback_out.to_string_lossy().to_string();
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use teloxide::prelude::*;
 use teloxide::utils::command::BotCommands;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 mod config;
 mod download;
@@ -36,6 +36,12 @@ async fn main() {
     let token = std::env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set");
 
     let config = Arc::new(Config::from_env());
+    info!(
+        ytdlp = %config.ytdlp_bin.display(),
+        ffmpeg = %config.ffmpeg_bin.display(),
+        ffprobe = %config.ffprobe_bin.display(),
+        "Resolved tool paths"
+    );
 
     let bot = Bot::new(&token);
 
