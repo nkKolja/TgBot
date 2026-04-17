@@ -95,23 +95,94 @@ fn do_install() {
     println!("  Logs:   {}/tgbot.log", repo.display());
     println!("  Errors: {}/tgbot-error.log", repo.display());
     println!();
-    println!("  Update:    tgbot service update");
-    println!("  Uninstall: tgbot service uninstall");
+    println!("  Update:    cargo run -- service update");
+    println!("  Uninstall: cargo run -- service uninstall");
+}
+
+fn find_brew() -> Option<PathBuf> {
+    for p in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"] {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn update_tools() {
+    println!("Updating external tools...");
+
+    let brew = find_brew();
+
+    // Resolve yt-dlp the same way config.rs does
+    let home = env::var("HOME").unwrap_or_default();
+    let ytdlp = [
+        "/opt/homebrew/bin/yt-dlp",
+        "/usr/local/bin/yt-dlp",
+        &format!("{home}/.local/bin/yt-dlp"),
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|p| p.exists())
+    .unwrap_or_else(|| PathBuf::from("yt-dlp"));
+
+    // Detect if yt-dlp is brew-managed
+    let is_brew_ytdlp = brew.is_some()
+        && ytdlp.to_string_lossy().contains("/homebrew/")
+        || ytdlp.to_string_lossy().starts_with("/usr/local/bin");
+
+    if is_brew_ytdlp {
+        // brew-managed: `yt-dlp --update` won't work
+        let brew = brew.as_ref().unwrap();
+        println!("  brew upgrade yt-dlp");
+        match Command::new(brew).args(["upgrade", "yt-dlp"]).status() {
+            Ok(s) if s.success() => println!("  yt-dlp: ok"),
+            Ok(s) => eprintln!("  brew upgrade yt-dlp exited with {s} (may already be latest)"),
+            Err(e) => eprintln!("  brew upgrade yt-dlp failed: {e}"),
+        }
+    } else {
+        // pip / pipx / standalone: self-update
+        println!("  yt-dlp --update");
+        match Command::new(&ytdlp).arg("--update").status() {
+            Ok(s) if s.success() => println!("  yt-dlp: ok"),
+            Ok(s) => eprintln!("  yt-dlp --update exited with {s}"),
+            Err(e) => eprintln!("  yt-dlp --update failed: {e}"),
+        }
+    }
+
+    // brew upgrade ffmpeg (ffprobe is part of the ffmpeg package)
+    if let Some(brew) = &brew {
+        println!("  brew upgrade ffmpeg");
+        match Command::new(brew).args(["upgrade", "ffmpeg"]).status() {
+            Ok(s) if s.success() => println!("  ffmpeg/ffprobe: ok"),
+            Ok(s) => eprintln!("  brew upgrade ffmpeg exited with {s} (may already be latest)"),
+            Err(e) => eprintln!("  brew upgrade ffmpeg failed: {e}"),
+        }
+    } else {
+        println!("  brew not found, skipping ffmpeg update");
+    }
+
+    println!();
 }
 
 fn do_update() {
-    let dst = plist_dst();
-    if !dst.exists() {
-        eprintln!("Service not installed. Run 'tgbot service install' first.");
-        std::process::exit(1);
+    let installed = plist_dst().exists();
+
+    if installed {
+        stop_service();
     }
 
-    stop_service();
+    update_tools();
     build(&repo_dir());
-    start_service();
 
-    println!();
-    println!("Updated and restarted.");
+    if installed {
+        start_service();
+        println!();
+        println!("Updated and restarted.");
+    } else {
+        println!();
+        println!("Updated. Service is not installed, skipping restart.");
+    }
 }
 
 fn do_uninstall() {
@@ -146,7 +217,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Some("uninstall") => do_uninstall(),
         Some("status") => do_status(),
         _ => {
-            eprintln!("Usage: tgbot service {{install|update|uninstall|status}}");
+            eprintln!("Usage: cargo run -- service {{install|update|uninstall|status}}");
             eprintln!();
             eprintln!("  install    Build and register the launchd service");
             eprintln!("  update     Rebuild and restart the running service");

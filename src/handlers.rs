@@ -155,7 +155,6 @@ pub async fn handle_callback(
         }
     }
 
-    // Determine the original message to reply to (find the message the prompt replied to, or use the prompt itself)
     let reply_msg = q
         .message
         .as_ref()
@@ -191,6 +190,5 @@ pub async fn handle_callback(
         bot.send_message(chat_id, format!("Error: {e}")).await?;
     }
 
-    // Mode remains Video — no change needed
     Ok(())
 }
