@@ -5,6 +5,10 @@ use std::time::Duration;
 pub struct ServiceCredentials {
     pub username: Option<String>,
     pub password: Option<String>,
+    /// Netscape-format cookie jar exported from a logged-in browser session.
+    /// yt-dlp ignores --username/--password for every site this bot supports,
+    /// so cookies are the only way to reach login-gated or age-gated posts.
+    pub cookies: Option<PathBuf>,
 }
 
 impl ServiceCredentials {
@@ -12,11 +16,15 @@ impl ServiceCredentials {
         Self {
             username: std::env::var(format!("{prefix}_USERNAME")).ok().filter(|s| !s.is_empty()),
             password: std::env::var(format!("{prefix}_PASSWORD")).ok().filter(|s| !s.is_empty()),
+            cookies: std::env::var(format!("{prefix}_COOKIES"))
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
         }
     }
 
     pub fn is_set(&self) -> bool {
-        self.username.is_some() && self.password.is_some()
+        self.cookies.is_some() || (self.username.is_some() && self.password.is_some())
     }
 }
 
@@ -28,6 +36,7 @@ pub struct Services {
     pub tiktok: ServiceCredentials,
     pub reddit: ServiceCredentials,
     pub linkedin: ServiceCredentials,
+    pub youtube: ServiceCredentials,
 }
 
 impl Services {
@@ -39,6 +48,7 @@ impl Services {
             tiktok: ServiceCredentials::from_env("TIKTOK"),
             reddit: ServiceCredentials::from_env("REDDIT"),
             linkedin: ServiceCredentials::from_env("LINKEDIN"),
+            youtube: ServiceCredentials::from_env("YOUTUBE"),
         }
     }
 
@@ -55,6 +65,8 @@ impl Services {
             &self.reddit
         } else if url.contains("linkedin.com") {
             &self.linkedin
+        } else if url.contains("youtube.com") || url.contains("youtu.be") {
+            &self.youtube
         } else {
             return None;
         };
@@ -68,6 +80,17 @@ pub struct Config {
     pub ffprobe_bin: PathBuf,
     pub download_timeout: Duration,
     pub long_video_secs: f64,
+    /// Largest file the Bot API will accept from us. 50 MB on api.telegram.org,
+    /// up to 2000 MB against a self-hosted Bot API server.
+    pub max_upload_bytes: u64,
+    /// Base URL of a self-hosted Bot API server, if any.
+    pub telegram_api_url: Option<String>,
+    /// Cookie jar used for any site without a service-specific one.
+    pub cookies_file: Option<PathBuf>,
+    /// `--cookies-from-browser` spec (e.g. `chrome`, `firefox:default`).
+    pub cookies_from_browser: Option<String>,
+    /// Retry a login-walled download once with cookies from a detected browser.
+    pub cookies_auto: bool,
     pub services: Services,
 }
 
@@ -76,11 +99,16 @@ impl Config {
         let timeout_secs = std::env::var("DOWNLOAD_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(30);
+            .unwrap_or(60);
         let long_video_secs = std::env::var("LONG_VIDEO_SECS")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(300.0);
+        let max_upload_mb = std::env::var("MAX_UPLOAD_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|mb| *mb > 0)
+            .unwrap_or(50);
         Self {
             ytdlp_bin: std::env::var("YTDLP_BIN")
                 .map(PathBuf::from)
@@ -93,6 +121,18 @@ impl Config {
                 .unwrap_or_else(|_| which("ffprobe")),
             download_timeout: Duration::from_secs(timeout_secs),
             long_video_secs,
+            max_upload_bytes: max_upload_mb * 1024 * 1024,
+            telegram_api_url: std::env::var("TELEGRAM_API_URL").ok().filter(|s| !s.is_empty()),
+            cookies_file: std::env::var("COOKIES_FILE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            cookies_from_browser: std::env::var("COOKIES_FROM_BROWSER")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            cookies_auto: std::env::var("COOKIES_AUTO")
+                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
             services: Services::from_env(),
         }
     }

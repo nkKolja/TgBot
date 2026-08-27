@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use rand::seq::SliceRandom;
 use tokio::process::Command as AsyncCommand;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::config::Config;
 
@@ -141,7 +142,28 @@ pub fn find_prefixed_file(dir: &Path, prefix: &str) -> Option<PathBuf> {
 
 pub fn ytdlp_auth_args(url: &str, config: &Config) -> Vec<String> {
     let mut args = Vec::new();
-    if let Some(creds) = config.services.for_url(url) {
+    let creds = config.services.for_url(url);
+
+    // Cookies first: a per-service jar wins over the shared one, which wins over
+    // pulling them straight out of a browser profile.
+    let cookie_file = creds
+        .and_then(|c| c.cookies.as_ref())
+        .or(config.cookies_file.as_ref());
+    if let Some(path) = cookie_file {
+        if path.exists() {
+            args.push("--cookies".into());
+            args.push(path.to_string_lossy().into_owned());
+        } else {
+            warn!("Cookie file {} does not exist, ignoring", path.display());
+        }
+    } else if let Some(browser) = &config.cookies_from_browser {
+        args.push("--cookies-from-browser".into());
+        args.push(browser.clone());
+    }
+
+    // yt-dlp has no password login for any site this bot supports — it only warns
+    // and carries on — but pass it through in case a future extractor gains one.
+    if let Some(creds) = creds {
         if let (Some(u), Some(p)) = (&creds.username, &creds.password) {
             args.push("--username".into());
             args.push(u.clone());
@@ -150,6 +172,67 @@ pub fn ytdlp_auth_args(url: &str, config: &Config) -> Vec<String> {
         }
     }
     args
+}
+
+/// Browsers yt-dlp can pull cookies out of, best first. Firefox leads because
+/// its jar is plain SQLite in the home directory; Chromium browsers need macOS
+/// Keychain access, which a launchd service normally cannot get.
+const BROWSER_PROFILES: &[(&str, &str)] = &[
+    ("firefox", "Library/Application Support/Firefox"),
+    ("chrome", "Library/Application Support/Google/Chrome"),
+    ("brave", "Library/Application Support/BraveSoftware/Brave-Browser"),
+    ("edge", "Library/Application Support/Microsoft Edge"),
+    ("vivaldi", "Library/Application Support/Vivaldi"),
+    ("chromium", "Library/Application Support/Chromium"),
+];
+
+/// First browser with a profile on disk, for `--cookies-from-browser`.
+pub fn detect_browser() -> Option<&'static str> {
+    static DETECTED: OnceLock<Option<&'static str>> = OnceLock::new();
+    *DETECTED.get_or_init(|| {
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        BROWSER_PROFILES
+            .iter()
+            .find(|(_, dir)| home.join(dir).is_dir())
+            .map(|(name, _)| *name)
+    })
+}
+
+/// Whether a yt-dlp failure looks like a login or age wall rather than a real
+/// error. yt-dlp appends a "Use --cookies..." hint to exactly these.
+pub fn is_auth_failure(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    [
+        "--cookies",
+        "age-restricted",
+        "age restricted",
+        "sign in to confirm",
+        "log in to continue",
+        "login required",
+        "private video",
+        "members-only",
+        "requested content is not available",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Duration in seconds of an already-downloaded media file.
+pub async fn media_duration(ffprobe: &Path, path: &Path) -> Option<f64> {
+    let out = AsyncCommand::new(ffprobe)
+        .args([
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok()
 }
 
 /// Get video duration in seconds using yt-dlp extract_info (no download).
@@ -169,5 +252,34 @@ pub async fn get_video_duration(url: &str, config: &Config) -> Option<f64> {
             s.trim().parse::<f64>().ok()
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_walls_are_recognised() {
+        // Real yt-dlp output: every login-gated failure carries the cookie hint.
+        assert!(is_auth_failure(
+            "ERROR: [Instagram] C123: Instagram sent an empty media response. \
+             ... then use --cookies-from-browser or --cookies for the authentication."
+        ));
+        assert!(is_auth_failure(
+            "ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate."
+        ));
+        assert!(is_auth_failure("This video is age-restricted"));
+    }
+
+    #[test]
+    fn ordinary_failures_are_not_retried() {
+        assert!(!is_auth_failure(
+            "yt-dlp cancelled: download exceeded 60s limit"
+        ));
+        assert!(!is_auth_failure(
+            "ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader"
+        ));
+        assert!(!is_auth_failure("ffmpeg failed: no such file or directory"));
     }
 }

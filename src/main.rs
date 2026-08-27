@@ -43,7 +43,17 @@ async fn main() {
         "Resolved tool paths"
     );
 
-    let bot = Bot::new(&token);
+    let mut bot = Bot::new(&token);
+    // A self-hosted Bot API server lifts the upload cap from 50 MB to 2000 MB.
+    if let Some(api_url) = &config.telegram_api_url {
+        match url::Url::parse(api_url) {
+            Ok(u) => {
+                info!("Using local Bot API server at {u}");
+                bot = bot.set_api_url(u);
+            }
+            Err(e) => error!("Invalid TELEGRAM_API_URL {api_url}: {e}"),
+        }
+    }
 
     if let Err(e) = bot.set_my_commands(Cmd::bot_commands()).await {
         error!("Failed to set bot commands: {e}");
