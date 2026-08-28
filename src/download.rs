@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use teloxide::prelude::*;
@@ -262,6 +263,21 @@ async fn split_media(
     Ok(chunks)
 }
 
+/// Last `max_chars` characters, cut at a line boundary. yt-dlp puts the fatal
+/// ERROR line last, so the tail is the part worth reporting.
+fn tail(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let cut: String = text.chars().skip(count - max_chars).collect();
+    match cut.find('\n') {
+        Some(i) => cut[i + 1..].to_string(),
+        None => cut,
+    }
+}
+
 // --- yt-dlp ------------------------------------------------------------------
 
 async fn run_ytdlp(
@@ -315,6 +331,11 @@ async fn spawn_ytdlp(
     }
     cmd.arg(url);
     cmd.kill_on_drop(true);
+    // Without explicit pipes the child inherits our stdio and wait_with_output()
+    // hands back empty buffers — which silently blinds every check we make on
+    // yt-dlp's output below.
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
     let child = cmd.spawn()?;
     let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
@@ -324,8 +345,10 @@ async fn spawn_ytdlp(
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             if !output.status.success() {
-                let detail = if !stderr.is_empty() { &stderr } else { &stdout };
-                return Err(format!("yt-dlp failed (exit {}): {detail}", output.status).into());
+                let detail = if stderr.trim().is_empty() { &stdout } else { &stderr };
+                return Err(
+                    format!("yt-dlp failed ({}): {}", output.status, tail(detail, 1200)).into(),
+                );
             }
             Ok(format!("{stderr}\n{stdout}"))
         }
@@ -639,4 +662,47 @@ async fn deliver_audio(
         send_audio_file(bot, msg, part, &part_title, config).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod live_check {
+    use super::*;
+
+    /// Manual smoke test for the cookie fallback, for use on the machine that
+    /// actually runs the bot:
+    ///
+    /// ```sh
+    /// TEST_URL="https://www.instagram.com/reel/..." \
+    ///   cargo test -- --ignored --nocapture
+    /// ```
+    ///
+    /// Needs network and a browser profile logged in to the site, so it is
+    /// ignored by default. Pass a URL that fails when logged out.
+    #[tokio::test]
+    #[ignore = "needs network and a logged-in browser profile"]
+    async fn login_walled_url_is_recovered_with_browser_cookies() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .try_init();
+        let url = std::env::var("TEST_URL").expect("set TEST_URL to a login-walled link");
+        let config = Config::from_env();
+
+        assert!(
+            detect_browser().is_some(),
+            "no browser profile found to take cookies from"
+        );
+
+        let result = run_ytdlp(
+            &["--no-download", "--print", "%(id)s"],
+            &url,
+            &config,
+            Duration::from_secs(90),
+        )
+        .await;
+
+        match result {
+            Ok(out) => println!("recovered: {}", out.trim()),
+            Err(e) => panic!("still blocked after the cookie retry: {e}"),
+        }
+    }
 }

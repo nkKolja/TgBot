@@ -199,22 +199,37 @@ pub fn detect_browser() -> Option<&'static str> {
 }
 
 /// Whether a yt-dlp failure looks like a login or age wall rather than a real
-/// error. yt-dlp appends a "Use --cookies..." hint to exactly these.
+/// error. Most login-gated failures carry yt-dlp's "Use --cookies..." hint, but
+/// some extractors pass the site's own wording through untouched.
 pub fn is_auth_failure(output: &str) -> bool {
     let lower = output.to_lowercase();
-    [
-        "--cookies",
-        "age-restricted",
-        "age restricted",
-        "sign in to confirm",
-        "log in to continue",
-        "login required",
-        "private video",
-        "members-only",
-        "requested content is not available",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    lower
+        .lines()
+        // yt-dlp prints this warning whenever *_USERNAME is set for a site with
+        // no password login. It mentions --cookies but says nothing about why
+        // this particular download failed, so it must not trigger a retry.
+        .filter(|line| !line.contains("login with password is not supported"))
+        .any(|line| {
+            [
+                "--cookies",
+                "age-restricted",
+                "age restricted",
+                "sign in to confirm",
+                "log in to continue",
+                "login required",
+                "private video",
+                "members-only",
+                // Instagram passes its own gating text through verbatim.
+                "available to everyone",
+                "certain audiences",
+                "only available for registered users",
+                "restricted video",
+                "content is unreachable",
+                "need to log in",
+            ]
+            .iter()
+            .any(|needle| line.contains(needle))
+        })
 }
 
 /// Duration in seconds of an already-downloaded media file.
@@ -270,6 +285,21 @@ mod tests {
             "ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate."
         ));
         assert!(is_auth_failure("This video is age-restricted"));
+        // Instagram's own wording, with no cookie hint attached.
+        assert!(is_auth_failure(
+            "ERROR: [Instagram] DcExxxnBMGa: This content isn't available to everyone: \
+             It can't be seen by certain audiences."
+        ));
+    }
+
+    #[test]
+    fn the_password_warning_alone_does_not_trigger_a_retry() {
+        // Emitted whenever *_USERNAME is set, on every failure, relevant or not.
+        assert!(!is_auth_failure(
+            "WARNING: [Instagram] Login with password is not supported for this website. \
+             Use --cookies-from-browser or --cookies for the authentication.\n\
+             ERROR: [Instagram] abc: Video unavailable. This post has been deleted"
+        ));
     }
 
     #[test]
