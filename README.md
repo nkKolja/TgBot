@@ -64,11 +64,15 @@ Or read them straight from a browser profile:
 COOKIES_FROM_BROWSER=firefox
 ```
 
-**This happens automatically.** With no cookies configured at all, a download
-that hits a login or age wall is retried once with `--cookies-from-browser`
-against the first browser profile found on disk, in this order: Firefox,
-Chrome, Brave, Edge, Vivaldi, Chromium. Nothing to configure — the browser just
-has to be logged in to the site. Turn it off with `COOKIES_AUTO=false`.
+Note the difference between the two: anything set above (`*_COOKIES`,
+`COOKIES_FILE`, `COOKIES_FROM_BROWSER`) is sent on **every** request.
+
+**With none of them set, cookies are used only as a fallback** — the download is
+attempted anonymously, and only if it hits a login or age wall is it retried
+once with `--cookies-from-browser` against the first browser profile found on
+disk, in this order: Firefox, Chrome, Brave, Edge, Vivaldi, Chromium. This is
+the default, it needs no configuration, and it keeps ordinary public downloads
+unattached to your account. Turn it off with `COOKIES_AUTO=false`.
 
 Firefox is tried first on purpose. Its cookie jar is plain SQLite in your home
 directory, so it works from a launchd background service. Chromium browsers
@@ -154,6 +158,89 @@ cargo run -- service status
 ```
 
 The service auto-starts on login and auto-restarts on crash (with a 10s cooldown). Logs are written to `tgbot.log` and `tgbot-error.log` in the repo directory.
+
+## Server setup (dedicated Mac)
+
+Start to finish on a machine that will run the bot full time. Do all of it
+logged in as the user the bot will run as.
+
+**1. Install the tools**
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+brew install yt-dlp ffmpeg firefox
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+**2. Get the bot**
+
+```bash
+git clone <this repo> ~/TgBot && cd ~/TgBot
+cp .env.example .env
+```
+
+Edit `.env` and set `TELEGRAM_BOT_TOKEN`.
+
+**3. Log in to Instagram, once**
+
+Open Firefox and log in to Instagram normally. Then:
+
+- Check **Settings → Privacy & Security** that *"Delete cookies and site data
+  when Firefox is closed"* is **off**, and that Firefox is not set to always use
+  Private Browsing. Either one throws the session away.
+- **Quit Firefox** (⌘Q). This matters: yt-dlp reads `cookies.sqlite` but not its
+  `-wal` sidecar, so a login that is still buffered in the WAL is invisible to
+  it. Quitting flushes it.
+
+Firefox never has to run again. Log in to YouTube in the same browser too if you
+want age-restricted videos to work.
+
+**4. Check the cookies work before involving the bot**
+
+```bash
+yt-dlp --cookies-from-browser firefox -F "https://www.instagram.com/p/SOME_POST/"
+```
+
+A list of formats means you are done. `could not find firefox cookies database`
+means step 3 did not stick.
+
+**5. Leave `.env` alone**
+
+Nothing to configure. With `COOKIES_FROM_BROWSER` **unset**, the bot downloads
+anonymously and only reaches for browser cookies after a download actually hits
+a login or age wall. That is the default and it is the mode you want.
+
+Setting `COOKIES_FROM_BROWSER=firefox` switches to sending your cookies on
+*every* request, which ties ordinary public downloads to your account for no
+benefit. Only do that if anonymous downloads stop working entirely.
+
+**6. Install the service**
+
+```bash
+cargo run -- service install
+cargo run -- service status
+tail -f tgbot.log
+```
+
+**7. Make it survive reboots**
+
+The bot installs as a **LaunchAgent**, which only starts inside a logged-in user
+session. On a headless server, turn on **System Settings → Users & Groups →
+Automatic login** for this user, or the bot stays down after a reboot until
+someone logs in physically.
+
+Also worth setting, in **System Settings → Energy**: *Prevent automatic
+sleeping*, and *Start up automatically after a power failure*.
+
+### When Instagram logs you out
+
+Sessions last months, not forever. When downloads start failing again: open
+Firefox, log in, quit Firefox. That is the whole fix — no rebuild, no restart,
+the bot picks up the new cookies on its next download.
+
+Use a throwaway Instagram account if you can. Pulling media through a session
+automatically is the kind of traffic Meta flags, and a disabled account is
+easier to shrug off when it is not your real one.
 
 ## Bot usage
 
