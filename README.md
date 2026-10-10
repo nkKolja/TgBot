@@ -8,7 +8,14 @@ Supported platforms: YouTube, Facebook, Instagram, TikTok, Twitter/X, Reddit, Li
 
 - **Rust** (1.80+) — [install](https://rustup.rs/)
 - **yt-dlp** — `brew install yt-dlp`
-- **gallery-dl** — `brew install gallery-dl` (photo posts and carousels; optional, but without it photo posts fail)
+- **gallery-dl** — `brew install gallery-dl` (photo posts and carousels; optional, but without it photo posts fail).
+  On **macOS 12 or older** Homebrew has no ready-made packages and tries to compile
+  Python, LLVM and Rust from source; install it with [uv](https://docs.astral.sh/uv/) instead, which needs no compiling:
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ~/.local/bin/uv tool install --python 3.13 gallery-dl
+  ```
+  The bot finds it in `~/.local/bin` on its own, and `service update` keeps it current.
 - **ffmpeg** (includes ffprobe) — `brew install ffmpeg`
 - **Telegram bot token** — get one from [@BotFather](https://t.me/BotFather)
 
@@ -172,7 +179,9 @@ cargo run -- service install
 
 ### Update (after pulling changes)
 
-Updates external tools (yt-dlp, gallery-dl, ffmpeg), rebuilds, and restarts the service.
+Updates external tools (yt-dlp, gallery-dl, ffmpeg) through whatever installed
+them (Homebrew, uv, or yt-dlp's own updater), rebuilds, and restarts the service.
+On macOS 12 and older it skips `brew upgrade`, which would compile from source there.
 Also works without the service installed — just updates tools and rebuilds:
 
 ```bash
@@ -205,6 +214,14 @@ logged in as the user the bot will run as.
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 brew install yt-dlp gallery-dl ffmpeg firefox
+```
+
+On macOS 12 or older (a 2013 Mac Pro, say), Homebrew compiles everything from
+source, which can take hours and often fails. Install gallery-dl with uv as
+shown under [Requirements](#requirements); yt-dlp can go the same way
+(`uv tool install --python 3.13 yt-dlp`).
+
+```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 

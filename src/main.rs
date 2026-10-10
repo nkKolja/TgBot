@@ -45,7 +45,7 @@ async fn main() {
         "Resolved tool paths"
     );
     if !config.gallery_dl_bin.is_file() {
-        warn!("gallery-dl not found: photo posts will not work (brew install gallery-dl)");
+        warn!("gallery-dl not found: photo posts will not work (see README, Requirements)");
     }
 
     let mut bot = Bot::new(&token);
