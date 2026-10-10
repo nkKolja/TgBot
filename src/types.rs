@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use teloxide::types::UserId;
+use teloxide::types::{ChatId, UserId};
 use teloxide::utils::command::BotCommands;
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -12,7 +13,19 @@ pub enum Mode {
 }
 
 pub type UserModes = Arc<DashMap<UserId, Mode>>;
-pub type PendingDownloads = Arc<DashMap<UserId, String>>;
+
+/// A long video waiting for the user to pick audio or video.
+pub struct Pending {
+    pub url: String,
+    pub created: Instant,
+}
+
+/// Keyed by chat *and* user, so a second long link in another chat does not
+/// overwrite the first, and only the person who sent a link can answer for it.
+pub type PendingDownloads = Arc<DashMap<(ChatId, UserId), Pending>>;
+
+/// How long the audio/video buttons stay valid.
+pub const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]

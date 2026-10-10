@@ -22,19 +22,40 @@ fn plist_dst() -> PathBuf {
         .join(format!("{PLIST_NAME}.plist"))
 }
 
-fn service_is_loaded() -> bool {
-    Command::new("launchctl")
-        .args(["list", PLIST_NAME])
-        .stdout(std::process::Stdio::null())
+/// launchd domain of the current login session, e.g. `gui/501`.
+fn gui_domain() -> Option<String> {
+    let out = Command::new("id").arg("-u").output().ok()?;
+    let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !uid.is_empty()).then(|| format!("gui/{uid}"))
+}
+
+fn quiet(cmd: &mut Command) -> bool {
+    cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
 }
 
+fn service_is_loaded() -> bool {
+    if let Some(domain) = gui_domain() {
+        if quiet(Command::new("launchctl").args(["print", &format!("{domain}/{PLIST_NAME}")])) {
+            return true;
+        }
+    }
+    // Older macOS, or a session launchd does not expose as gui/<uid>.
+    quiet(Command::new("launchctl").args(["list", PLIST_NAME]))
+}
+
 fn stop_service() {
-    if service_is_loaded() {
-        println!("Stopping service...");
+    if !service_is_loaded() {
+        return;
+    }
+    println!("Stopping service...");
+    let stopped = gui_domain().is_some_and(|domain| {
+        quiet(Command::new("launchctl").args(["bootout", &format!("{domain}/{PLIST_NAME}")]))
+    });
+    if !stopped {
         let dst = plist_dst();
         let _ = Command::new("launchctl")
             .args(["unload", &dst.to_string_lossy()])
@@ -45,12 +66,18 @@ fn stop_service() {
 fn start_service() {
     println!("Starting service...");
     let dst = plist_dst();
-    let status = Command::new("launchctl")
-        .args(["load", &dst.to_string_lossy()])
-        .status()
-        .expect("failed to run launchctl");
-    if !status.success() {
-        eprintln!("launchctl load failed");
+    let dst = dst.to_string_lossy();
+    // `bootstrap` is the supported interface; `load` is deprecated but still
+    // the one that works from some non-GUI sessions (e.g. over SSH).
+    let started = gui_domain()
+        .is_some_and(|domain| quiet(Command::new("launchctl").args(["bootstrap", &domain, &dst])))
+        || Command::new("launchctl")
+            .args(["load", "-w", &dst])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    if !started {
+        eprintln!("launchctl could not start the service");
         std::process::exit(1);
     }
 }
@@ -78,6 +105,9 @@ fn do_install() {
     }
 
     build(&repo);
+
+    // Re-running install must not fail because the service is already loaded.
+    stop_service();
 
     println!("Installing service plist...");
     let template = fs::read_to_string(&plist_src).expect("cannot read plist template");
@@ -126,14 +156,19 @@ fn update_tools() {
     .find(|p| p.exists())
     .unwrap_or_else(|| PathBuf::from("yt-dlp"));
 
-    // Detect if yt-dlp is brew-managed
-    let is_brew_ytdlp = brew.is_some()
-        && ytdlp.to_string_lossy().contains("/homebrew/")
-        || ytdlp.to_string_lossy().starts_with("/usr/local/bin");
+    // Ask brew whether it owns yt-dlp rather than guessing from the path:
+    // /usr/local/bin is brew's prefix on Intel Macs but also where standalone
+    // installs land, and brew may not be installed at all.
+    let brew_ytdlp = brew.as_ref().filter(|brew| {
+        Command::new(brew)
+            .args(["list", "--versions", "yt-dlp"])
+            .output()
+            .map(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
+            .unwrap_or(false)
+    });
 
-    if is_brew_ytdlp {
+    if let Some(brew) = brew_ytdlp {
         // brew-managed: `yt-dlp --update` won't work
-        let brew = brew.as_ref().unwrap();
         println!("  brew upgrade yt-dlp");
         match Command::new(brew).args(["upgrade", "yt-dlp"]).status() {
             Ok(s) if s.success() => println!("  yt-dlp: ok"),
@@ -200,9 +235,7 @@ fn do_uninstall() {
 fn do_status() {
     if service_is_loaded() {
         println!("Service is loaded.");
-        let _ = Command::new("launchctl")
-            .args(["list", PLIST_NAME])
-            .status();
+        let _ = Command::new("launchctl").args(["list", PLIST_NAME]).status();
     } else {
         println!("Service is not loaded.");
     }

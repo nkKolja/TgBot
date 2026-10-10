@@ -1,21 +1,27 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tracing::warn;
+
+use crate::helpers::host_matches;
+
 #[derive(Clone, Debug, Default)]
 pub struct ServiceCredentials {
-    pub username: Option<String>,
-    pub password: Option<String>,
     /// Netscape-format cookie jar exported from a logged-in browser session.
-    /// yt-dlp ignores --username/--password for every site this bot supports,
-    /// so cookies are the only way to reach login-gated or age-gated posts.
+    /// yt-dlp has no password login for any site this bot supports, so cookies
+    /// are the only way to reach login-gated or age-gated posts.
     pub cookies: Option<PathBuf>,
 }
 
 impl ServiceCredentials {
     fn from_env(prefix: &str) -> Self {
+        // *_USERNAME / *_PASSWORD used to be passed to yt-dlp, which ignored
+        // them and printed a warning — while exposing the password to anyone
+        // running `ps`. They are no longer read.
+        if std::env::var(format!("{prefix}_PASSWORD")).is_ok_and(|s| !s.is_empty()) {
+            warn!("{prefix}_PASSWORD is set but ignored: yt-dlp cannot log in with a password. Use {prefix}_COOKIES.");
+        }
         Self {
-            username: std::env::var(format!("{prefix}_USERNAME")).ok().filter(|s| !s.is_empty()),
-            password: std::env::var(format!("{prefix}_PASSWORD")).ok().filter(|s| !s.is_empty()),
             cookies: std::env::var(format!("{prefix}_COOKIES"))
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -24,7 +30,7 @@ impl ServiceCredentials {
     }
 
     pub fn is_set(&self) -> bool {
-        self.cookies.is_some() || (self.username.is_some() && self.password.is_some())
+        self.cookies.is_some()
     }
 }
 
@@ -53,19 +59,21 @@ impl Services {
     }
 
     pub fn for_url(&self, url: &str) -> Option<&ServiceCredentials> {
-        let creds = if url.contains("facebook.com") {
+        let host = url::Url::parse(url).ok()?.host_str()?.to_owned();
+        let is = |domain: &str| host_matches(&host, domain);
+        let creds = if is("facebook.com") || is("fb.watch") {
             &self.facebook
-        } else if url.contains("instagram.com") {
+        } else if is("instagram.com") {
             &self.instagram
-        } else if url.contains("x.com") || url.contains("twitter.com") {
+        } else if is("x.com") || is("twitter.com") {
             &self.twitter
-        } else if url.contains("tiktok.com") {
+        } else if is("tiktok.com") {
             &self.tiktok
-        } else if url.contains("reddit.com") {
+        } else if is("reddit.com") {
             &self.reddit
-        } else if url.contains("linkedin.com") {
+        } else if is("linkedin.com") {
             &self.linkedin
-        } else if url.contains("youtube.com") || url.contains("youtu.be") {
+        } else if is("youtube.com") || is("youtu.be") {
             &self.youtube
         } else {
             return None;
@@ -92,6 +100,18 @@ pub struct Config {
     /// Retry a login-walled download once with cookies from a detected browser.
     pub cookies_auto: bool,
     pub services: Services,
+    /// Upper bound on any single ffmpeg run (re-encode, shrink, split).
+    pub encode_timeout: Duration,
+    /// x264 speed/size trade-off. `veryfast` keeps re-encodes tolerable on an
+    /// old Xeon; `fast`/`medium` give smaller files on newer machines.
+    pub x264_preset: String,
+    /// Limits how many ffmpeg processes run at once. x264 already uses every
+    /// core, so parallel encodes only make each one slower and risk timeouts.
+    pub encode_slots: tokio::sync::Semaphore,
+}
+
+fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok().and_then(|s| s.trim().parse::<T>().ok())
 }
 
 impl Config {
@@ -134,6 +154,16 @@ impl Config {
                 .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
                 .unwrap_or(true),
             services: Services::from_env(),
+            encode_timeout: Duration::from_secs(
+                env_parse::<u64>("ENCODE_TIMEOUT_SECS").filter(|s| *s > 0).unwrap_or(600),
+            ),
+            x264_preset: std::env::var("X264_PRESET")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "veryfast".to_string()),
+            encode_slots: tokio::sync::Semaphore::new(
+                env_parse::<usize>("MAX_CONCURRENT_ENCODES").filter(|n| *n > 0).unwrap_or(1),
+            ),
         }
     }
 }

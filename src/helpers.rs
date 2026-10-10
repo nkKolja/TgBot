@@ -17,6 +17,7 @@ const SUPPORTED_DOMAINS: &[&str] = &[
     "youtube.com",
     "reddit.com",
     "linkedin.com",
+    "fb.watch",
 ];
 
 const GREETINGS: &[&str] = &[
@@ -58,8 +59,49 @@ pub fn capitalize_first(s: &str) -> String {
     }
 }
 
-pub fn is_supported_url(text: &str) -> bool {
-    SUPPORTED_DOMAINS.iter().any(|d| text.contains(d))
+/// True when `host` is `domain` itself or one of its subdomains, so that
+/// `x.com` matches `x.com` and `mobile.x.com` but not `dropbox.com`.
+pub fn host_matches(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|rest| rest.ends_with('.'))
+}
+
+/// Parse one candidate token as a link to a supported site. Accepts links with
+/// or without a scheme (`youtu.be/abc`), strips punctuation that commonly
+/// clings to a link in prose, and rejects bare domains with no path, which
+/// cannot point at any media.
+pub fn supported_url(candidate: &str) -> Option<String> {
+    let token = candidate.trim_matches(|c: char| {
+        matches!(c, '<' | '>' | '(' | ')' | '[' | ']' | '"' | '\'' | ',' | '.' | '!' | '?' | ';' | '«' | '»')
+    });
+    if token.is_empty() {
+        return None;
+    }
+    let lower = token.to_ascii_lowercase();
+    let with_scheme = if lower.starts_with("http://") || lower.starts_with("https://") {
+        token.to_string()
+    } else if token.contains("://") {
+        return None;
+    } else {
+        format!("https://{token}")
+    };
+    let url = url::Url::parse(&with_scheme).ok()?;
+    let host = url.host_str()?;
+    if !SUPPORTED_DOMAINS.iter().any(|d| host_matches(host, d)) {
+        return None;
+    }
+    if url.path().len() <= 1 && url.query().is_none() {
+        return None;
+    }
+    Some(url.into())
+}
+
+/// First link to a supported site anywhere in a message's text.
+pub fn extract_supported_url(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(supported_url)
 }
 
 pub async fn video_dimensions(ffprobe: &Path, path: &Path) -> (Option<u32>, Option<u32>) {
@@ -161,16 +203,6 @@ pub fn ytdlp_auth_args(url: &str, config: &Config) -> Vec<String> {
         args.push(browser.clone());
     }
 
-    // yt-dlp has no password login for any site this bot supports — it only warns
-    // and carries on — but pass it through in case a future extractor gains one.
-    if let Some(creds) = creds {
-        if let (Some(u), Some(p)) = (&creds.username, &creds.password) {
-            args.push("--username".into());
-            args.push(u.clone());
-            args.push("--password".into());
-            args.push(p.clone());
-        }
-    }
     args
 }
 
@@ -230,6 +262,26 @@ pub fn is_auth_failure(output: &str) -> bool {
             .iter()
             .any(|needle| line.contains(needle))
         })
+}
+
+/// Turn an internal error into something short enough to show in the chat.
+/// Raw yt-dlp output can run to a kilobyte of tracebacks and temp paths; the
+/// user only needs its final ERROR line.
+pub fn user_facing_error(err: &str) -> String {
+    const MAX_CHARS: usize = 300;
+    let lower = err.to_lowercase();
+    let detail = if lower.contains("cancelled") && lower.contains("limit") {
+        "Преузимање је трајало предуго.".to_string()
+    } else if let Some(line) = err.lines().rev().find(|l| l.contains("ERROR:")) {
+        line.split_once("ERROR:").map(|(_, r)| r.trim().to_string()).unwrap_or_default()
+    } else {
+        err.lines().next().unwrap_or("").trim().to_string()
+    };
+    let mut detail: String = detail.chars().take(MAX_CHARS).collect();
+    if detail.chars().count() == MAX_CHARS {
+        detail.push('…');
+    }
+    format!("Грешка: {detail}")
 }
 
 /// Duration in seconds of an already-downloaded media file.
@@ -311,5 +363,54 @@ mod tests {
             "ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader"
         ));
         assert!(!is_auth_failure("ffmpeg failed: no such file or directory"));
+    }
+
+    #[test]
+    fn supported_links_are_found_inside_prose() {
+        assert_eq!(
+            extract_supported_url("look at this https://youtu.be/dQw4w9WgXcQ haha").as_deref(),
+            Some("https://youtu.be/dQw4w9WgXcQ")
+        );
+        assert_eq!(
+            extract_supported_url("(www.instagram.com/reel/C123/),").as_deref(),
+            Some("https://www.instagram.com/reel/C123/")
+        );
+        assert_eq!(
+            extract_supported_url("https://mobile.x.com/user/status/1").as_deref(),
+            Some("https://mobile.x.com/user/status/1")
+        );
+    }
+
+    #[test]
+    fn lookalike_and_bare_domains_are_rejected() {
+        assert_eq!(extract_supported_url("https://www.dropbox.com/s/abc/file.mp4"), None);
+        assert_eq!(extract_supported_url("https://box.com/v/abc"), None);
+        assert_eq!(extract_supported_url("https://notyoutube.com/watch?v=1"), None);
+        assert_eq!(extract_supported_url("https://youtube.com.evil.io/watch?v=1"), None);
+        assert_eq!(extract_supported_url("I use instagram.com a lot"), None);
+        assert_eq!(extract_supported_url("ftp://youtube.com/watch"), None);
+        assert_eq!(extract_supported_url("hello"), None);
+    }
+
+    #[test]
+    fn host_matching_is_label_aligned() {
+        assert!(host_matches("x.com", "x.com"));
+        assert!(host_matches("WWW.X.COM", "x.com"));
+        assert!(host_matches("www.x.com.", "x.com"));
+        assert!(!host_matches("dropbox.com", "x.com"));
+        assert!(!host_matches("x.com.evil.io", "x.com"));
+    }
+
+    #[test]
+    fn user_facing_errors_keep_only_the_relevant_line() {
+        let raw = "yt-dlp failed (exit status: 1): WARNING: something\n\
+                   [debug] /var/folders/xy/T/.tmpAbc/video.%(ext)s\n\
+                   ERROR: [youtube] abc: Video unavailable";
+        assert_eq!(user_facing_error(raw), "Грешка: [youtube] abc: Video unavailable");
+        assert_eq!(
+            user_facing_error("yt-dlp cancelled: download exceeded 60s limit"),
+            "Грешка: Преузимање је трајало предуго."
+        );
+        assert!(user_facing_error(&"x".repeat(5000)).chars().count() < 320);
     }
 }
