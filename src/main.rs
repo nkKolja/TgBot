@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 
 mod config;
 mod download;
+mod gallery;
 mod handlers;
 mod helpers;
 mod service;
@@ -40,8 +41,12 @@ async fn main() {
         ytdlp = %config.ytdlp_bin.display(),
         ffmpeg = %config.ffmpeg_bin.display(),
         ffprobe = %config.ffprobe_bin.display(),
+        gallery_dl = %config.gallery_dl_bin.display(),
         "Resolved tool paths"
     );
+    if !config.gallery_dl_bin.is_file() {
+        warn!("gallery-dl not found: photo posts will not work (brew install gallery-dl)");
+    }
 
     let mut bot = Bot::new(&token);
     // A self-hosted Bot API server lifts the upload cap from 50 MB to 2000 MB.

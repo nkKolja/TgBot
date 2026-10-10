@@ -156,18 +156,20 @@ fn update_tools() {
     .find(|p| p.exists())
     .unwrap_or_else(|| PathBuf::from("yt-dlp"));
 
-    // Ask brew whether it owns yt-dlp rather than guessing from the path:
+    // Ask brew whether it owns a tool rather than guessing from the path:
     // /usr/local/bin is brew's prefix on Intel Macs but also where standalone
     // installs land, and brew may not be installed at all.
-    let brew_ytdlp = brew.as_ref().filter(|brew| {
-        Command::new(brew)
-            .args(["list", "--versions", "yt-dlp"])
-            .output()
-            .map(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
-            .unwrap_or(false)
-    });
+    let brew_owns = |name: &str| {
+        brew.as_ref().filter(|brew| {
+            Command::new(brew)
+                .args(["list", "--versions", name])
+                .output()
+                .map(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
+                .unwrap_or(false)
+        })
+    };
 
-    if let Some(brew) = brew_ytdlp {
+    if let Some(brew) = brew_owns("yt-dlp") {
         // brew-managed: `yt-dlp --update` won't work
         println!("  brew upgrade yt-dlp");
         match Command::new(brew).args(["upgrade", "yt-dlp"]).status() {
@@ -183,6 +185,22 @@ fn update_tools() {
             Ok(s) => eprintln!("  yt-dlp --update exited with {s}"),
             Err(e) => eprintln!("  yt-dlp --update failed: {e}"),
         }
+    }
+
+    // gallery-dl fetches photo posts. Sites change often enough that an old
+    // copy stops working, so it is kept current along with yt-dlp.
+    if let Some(brew) = brew_owns("gallery-dl") {
+        println!("  brew upgrade gallery-dl");
+        match Command::new(brew).args(["upgrade", "gallery-dl"]).status() {
+            Ok(s) if s.success() => println!("  gallery-dl: ok"),
+            Ok(s) => eprintln!("  brew upgrade gallery-dl exited with {s} (may already be latest)"),
+            Err(e) => eprintln!("  brew upgrade gallery-dl failed: {e}"),
+        }
+    } else if crate::config::which("gallery-dl").is_file() {
+        println!("  gallery-dl is not from Homebrew; update it the way it was installed");
+        println!("  (for example: pip install -U gallery-dl)");
+    } else {
+        println!("  gallery-dl is not installed; photo posts need it: brew install gallery-dl");
     }
 
     // brew upgrade ffmpeg (ffprobe is part of the ffmpeg package)

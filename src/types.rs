@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use teloxide::types::{ChatId, UserId};
+use teloxide::types::{ChatId, Message, MessageId, UserId};
 use teloxide::utils::command::BotCommands;
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -36,4 +36,20 @@ pub enum Cmd {
     Video,
     #[command(description = "Преузми линк као аудио")]
     Audio,
+}
+
+/// Where a reply goes: the chat, and in groups the message being answered.
+#[derive(Clone, Copy, Debug)]
+pub struct Target {
+    pub chat: ChatId,
+    pub reply_to: Option<MessageId>,
+}
+
+impl Target {
+    pub fn of(msg: &Message) -> Self {
+        Self {
+            chat: msg.chat.id,
+            reply_to: (!msg.chat.is_private()).then_some(msg.id),
+        }
+    }
 }

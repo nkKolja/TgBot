@@ -99,6 +99,63 @@ pub fn supported_url(candidate: &str) -> Option<String> {
     Some(url.into())
 }
 
+/// An Instagram post link: `/p/<code>`, also in the `/<user>/p/<code>` and
+/// `/share/p/<code>` forms. Reels and IGTV links are videos and stay with yt-dlp.
+pub fn is_instagram_post(url: &str) -> bool {
+    let Ok(url) = url::Url::parse(url) else { return false };
+    if !url.host_str().is_some_and(|h| host_matches(h, "instagram.com")) {
+        return false;
+    }
+    let segments: Vec<&str> = url
+        .path_segments()
+        .map(|s| s.filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    matches!(segments.as_slice(), ["p", _, ..] | [_, "p", _, ..])
+}
+
+/// Whether a yt-dlp failure means the link has no video at all — usually a
+/// photo post, which gallery-dl can fetch instead.
+pub fn is_no_video(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    [
+        "no video formats found",
+        "there is no video",
+        "no video could be found",
+        "no video in this",
+        "does not contain any video",
+        "no media found",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Whether a gallery-dl failure looks like a login wall. gallery-dl reports
+/// problems as "[instagram][error] HTTP redirect to login page (...)" or
+/// "[twitter][error] AuthRequired: 'authenticated cookies' needed to access ...".
+pub fn is_gallery_auth_failure(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    lower
+        .lines()
+        .filter(|line| line.contains("][error]") || line.contains("][warning]"))
+        .any(|line| {
+            [
+                "redirect to login",
+                "redirect to challenge",
+                "login required",
+                "authrequired",
+                "authorizationerror",
+                "authenticationerror",
+                "needed to access",
+                "401 unauthorized",
+                "403 forbidden",
+                "is private",
+                "cookies",
+            ]
+            .iter()
+            .any(|needle| line.contains(needle))
+        })
+}
+
 /// First link to a supported site anywhere in a message's text.
 pub fn extract_supported_url(text: &str) -> Option<String> {
     text.split_whitespace().find_map(supported_url)
@@ -274,6 +331,10 @@ pub fn user_facing_error(err: &str) -> String {
         "Преузимање је трајало предуго.".to_string()
     } else if let Some(line) = err.lines().rev().find(|l| l.contains("ERROR:")) {
         line.split_once("ERROR:").map(|(_, r)| r.trim().to_string()).unwrap_or_default()
+    } else if let Some(line) = err.lines().find(|l| l.contains("][error] ")) {
+        // gallery-dl: the first error is the cause; later ones are fallout
+        // such as "Failed to download ...".
+        line.split_once("][error] ").map(|(_, r)| r.trim().to_string()).unwrap_or_default()
     } else {
         err.lines().next().unwrap_or("").trim().to_string()
     };
@@ -412,5 +473,57 @@ mod tests {
             "Грешка: Преузимање је трајало предуго."
         );
         assert!(user_facing_error(&"x".repeat(5000)).chars().count() < 320);
+    }
+
+    #[test]
+    fn instagram_posts_are_told_apart_from_reels() {
+        assert!(is_instagram_post("https://www.instagram.com/p/C3xYz_AbCd/"));
+        assert!(is_instagram_post("https://instagram.com/p/C3xYz_AbCd/?igsh=abc"));
+        assert!(is_instagram_post("https://www.instagram.com/someone/p/C3xYz_AbCd/"));
+        assert!(is_instagram_post("https://www.instagram.com/share/p/BAxYz/"));
+        assert!(!is_instagram_post("https://www.instagram.com/reel/C3xYz_AbCd/"));
+        assert!(!is_instagram_post("https://www.instagram.com/tv/C3xYz_AbCd/"));
+        assert!(!is_instagram_post("https://www.instagram.com/someone/"));
+        assert!(!is_instagram_post("https://www.instagram.com/p/"));
+        assert!(!is_instagram_post("https://example.com/p/C3xYz_AbCd/"));
+    }
+
+    #[test]
+    fn photo_posts_are_recognised_from_ytdlp_errors() {
+        assert!(is_no_video("ERROR: [Instagram] C3x: No video formats found!"));
+        assert!(is_no_video("ERROR: [Instagram] C3x: There is no video in this post"));
+        assert!(is_no_video("ERROR: [twitter] 123: No video could be found in this tweet"));
+        assert!(!is_no_video("ERROR: [youtube] abc: Video unavailable"));
+        assert!(!is_no_video("yt-dlp cancelled: download exceeded the 60s limit"));
+    }
+
+    #[test]
+    fn gallery_dl_login_walls_are_recognised() {
+        assert!(is_gallery_auth_failure(
+            "[instagram][error] HTTP redirect to login page (https://www.instagram.com/accounts/login/)"
+        ));
+        assert!(is_gallery_auth_failure(
+            "[instagram][error] HttpError: '401 Unauthorized' for 'https://www.instagram.com/api/v1/media/1/info/'"
+        ));
+        assert!(is_gallery_auth_failure(
+            "[twitter][error] AuthRequired: 'authenticated cookies' needed to access this timeline"
+        ));
+        assert!(!is_gallery_auth_failure(
+            "[downloader.http][warning] '404 File not found' for 'https://x/a.jpg'\n\
+             [download][error] Failed to download a.jpg"
+        ));
+        // Info lines mentioning a login are not failures.
+        assert!(!is_gallery_auth_failure("[instagram][info] Logging in as someone"));
+    }
+
+    #[test]
+    fn gallery_dl_errors_show_the_cause() {
+        let raw = "gallery-dl failed (exit status: 4): \
+                   [instagram][error] HTTP redirect to login page (https://www.instagram.com/accounts/login/)\n\
+                   [download][error] Failed to download x.jpg";
+        assert_eq!(
+            user_facing_error(raw),
+            "Грешка: HTTP redirect to login page (https://www.instagram.com/accounts/login/)"
+        );
     }
 }

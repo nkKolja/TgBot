@@ -1,13 +1,14 @@
 # TgBot (Rust)
 
-Telegram bot that downloads videos and audio from links and sends them back in the chat.
+Telegram bot that downloads videos, audio and photos from links and sends them back in the chat.
 
 Supported platforms: YouTube, Facebook, Instagram, TikTok, Twitter/X, Reddit, LinkedIn, and 1800+ more via yt-dlp can be enabled.
 
 ## Requirements
 
-- **Rust** (1.70+) — [install](https://rustup.rs/)
+- **Rust** (1.80+) — [install](https://rustup.rs/)
 - **yt-dlp** — `brew install yt-dlp`
+- **gallery-dl** — `brew install gallery-dl` (photo posts and carousels; optional, but without it photo posts fail)
 - **ffmpeg** (includes ffprobe) — `brew install ffmpeg`
 - **Telegram bot token** — get one from [@BotFather](https://t.me/BotFather)
 
@@ -23,10 +24,11 @@ Edit `.env` and set your bot token:
 TELEGRAM_BOT_TOKEN=your_token_here
 ```
 
-`yt-dlp`, `ffmpeg`, and `ffprobe` are auto-detected from PATH and common locations (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`). To override:
+`yt-dlp`, `gallery-dl`, `ffmpeg`, and `ffprobe` are auto-detected from PATH and common locations (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`). To override:
 
 ```
 YTDLP_BIN=/opt/homebrew/bin/yt-dlp
+GALLERY_DL_BIN=/usr/local/bin/gallery-dl
 FFMPEG_BIN=/usr/local/bin/ffmpeg
 FFPROBE_BIN=/usr/local/bin/ffprobe
 ```
@@ -112,6 +114,36 @@ its audio converted while the video is copied. x264 runs with the `veryfast`
 preset and one encode at a time, which keeps an older Xeon Mac Pro inside the
 timeouts. See `X264_PRESET`, `MAX_CONCURRENT_ENCODES` and `ENCODE_TIMEOUT_SECS`.
 
+### Photos and carousels
+
+yt-dlp only downloads video, so photo posts go through
+[gallery-dl](https://github.com/mikf/gallery-dl):
+
+- **Instagram posts** (`instagram.com/p/…`) go to gallery-dl straight away,
+  since a post can be photos, a video, or a carousel mixing both. Reels stay
+  with yt-dlp.
+- **Any other link** where yt-dlp reports that there is no video (an image
+  tweet, say) is retried as a photo post. This also applies in `/audio` mode.
+
+Cookies work as for yt-dlp: anonymous first, then one retry with browser
+cookies. Instagram does not show posts to logged-out visitors, so in practice
+Instagram posts always use your Firefox login.
+
+What gets sent, within Telegram's limits:
+
+- Photos and videos go out as **albums** of up to 10, in post order. A carousel
+  of 20 becomes two albums. Each album is kept under the upload limit in total.
+- **Photos** must be JPEG or PNG, at most 10 MB, with width + height at most
+  10000. Anything else (WebP, HEIC, AVIF, oversized images) is converted to
+  JPEG and scaled to at most 2560 px, the largest size Telegram displays.
+- Images more elongated than 20:1 (long screenshots) are sent as **files**,
+  because Telegram refuses them as photos. GIFs are sent as **animations**.
+- **Videos** in a post get the same H.264 conversion and size fitting as
+  ordinary video links.
+- Telegram's flood control ("Too Many Requests") is waited out rather than
+  treated as an error, and items are paced about a second apart.
+- At most 20 items are sent per link.
+
 ### Auto-dubbed audio
 
 YouTube serves AI auto-dubbed audio tracks as the regional default, so
@@ -140,7 +172,7 @@ cargo run -- service install
 
 ### Update (after pulling changes)
 
-Updates external tools (yt-dlp, ffmpeg), rebuilds, and restarts the service.
+Updates external tools (yt-dlp, gallery-dl, ffmpeg), rebuilds, and restarts the service.
 Also works without the service installed — just updates tools and rebuilds:
 
 ```bash
@@ -172,7 +204,7 @@ logged in as the user the bot will run as.
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-brew install yt-dlp ffmpeg firefox
+brew install yt-dlp gallery-dl ffmpeg firefox
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
@@ -202,11 +234,13 @@ want age-restricted videos to work.
 **4. Check the cookies work before involving the bot**
 
 ```bash
-yt-dlp --cookies-from-browser firefox -F "https://www.instagram.com/p/SOME_POST/"
+yt-dlp --cookies-from-browser firefox -F "https://www.instagram.com/reel/SOME_REEL/"
+gallery-dl --cookies-from-browser firefox -g "https://www.instagram.com/p/SOME_POST/"
 ```
 
-A list of formats means you are done. `could not find firefox cookies database`
-means step 3 did not stick.
+A list of formats from the first and a list of image URLs from the second mean
+you are done. `could not find firefox cookies database`, or gallery-dl
+reporting a redirect to the login page, means step 3 did not stick.
 
 **5. Leave `.env` alone**
 
@@ -252,6 +286,7 @@ easier to shrug off when it is not your real one.
 - `/video` — switch to video mode (default)
 - `/audio` — switch to audio mode
 - Send a link — bot downloads and sends back the video or audio
+- Instagram posts and other photo posts come back as photos (albums for carousels)
 - For long videos the bot asks whether to download as audio or continue as video
 - The link can sit anywhere in the message ("look at this https://youtu.be/…"), or behind a text link
 - Downloads are capped at `DOWNLOAD_TIMEOUT_SECS` (60s by default) in total, to avoid wasting time on files that exceed Telegram's size limit
@@ -267,6 +302,7 @@ In groups, the bot only responds to supported links and stays silent on errors. 
 | `YTDLP_BIN` | auto-detected | Path to yt-dlp binary |
 | `FFMPEG_BIN` | auto-detected | Path to ffmpeg binary |
 | `FFPROBE_BIN` | auto-detected | Path to ffprobe binary |
+| `GALLERY_DL_BIN` | auto-detected | Path to gallery-dl binary (photo posts) |
 | `DOWNLOAD_TIMEOUT_SECS` | `60` | Max seconds for downloading one link, across all attempts. Downloads exceeding this are cancelled to keep the bot responsive. |
 | `ENCODE_TIMEOUT_SECS` | `600` | Max seconds for any single ffmpeg run (convert, shrink, split). |
 | `X264_PRESET` | `veryfast` | x264 preset for re-encodes. `veryfast` suits older Intel Macs; `fast` or `medium` give smaller files on faster CPUs. |
