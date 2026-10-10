@@ -277,6 +277,21 @@ cargo run -- service status
 tail -f tgbot.log
 ```
 
+**If the Mac runs an outbound firewall (LuLu, Little Snitch)**, it holds each
+new program's connections until someone approves them, and the background
+service has nobody to click the alert: downloads just time out. Approve these
+once, with the rule applying to the whole process (not just one address) and
+lasting always:
+
+- `tgbot` itself (send the bot a link after installing),
+- yt-dlp,
+- the Python that runs gallery-dl (`uv python find 3.13` shows its path), which
+  you can trigger with the gallery-dl check from step 4.
+
+An unsigned program can be asked about again after it changes (a rebuild, a
+yt-dlp update), so if the bot suddenly times out on everything, look at the
+firewall first.
+
 **7. Make it survive reboots**
 
 The bot installs as a **LaunchAgent**, which only starts inside a logged-in user
