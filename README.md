@@ -33,16 +33,11 @@ FFPROBE_BIN=/usr/local/bin/ffprobe
 
 ### Optional: cookies for private / age-restricted posts
 
-yt-dlp has **no username/password login** for any site this bot supports. Setting
-`INSTAGRAM_USERNAME`/`INSTAGRAM_PASSWORD` (or the equivalent for Facebook, X,
-TikTok, Reddit, LinkedIn, YouTube) does nothing except print
-
-```
-WARNING: Login with password is not supported for this website.
-```
-
-so private and age-restricted posts still fail with *"Age-restricted content —
-log in to continue"*. **Cookies are the only way in.**
+yt-dlp has **no username/password login** for any site this bot supports, so
+the bot does not read `*_USERNAME`/`*_PASSWORD` any more (it logs a warning if
+a password is still set). Private and age-restricted posts fail with
+*"Age-restricted content — log in to continue"* without cookies. **Cookies are
+the only way in.**
 
 Export a Netscape-format `cookies.txt` while logged in to the site (browser
 extensions such as "Get cookies.txt LOCALLY" do this) and point at it:
@@ -107,6 +102,15 @@ To lift the cap properly, run your own
 TELEGRAM_API_URL=http://localhost:8081
 MAX_UPLOAD_MB=2000
 ```
+
+### Re-encoding and older hardware
+
+Video is downloaded as H.264 whenever the site offers it, so most links go out
+with no re-encode at all. Only VP9/AV1 video or Opus audio is converted, and
+each stream is handled separately: a file with H.264 video and Opus audio gets
+its audio converted while the video is copied. x264 runs with the `veryfast`
+preset and one encode at a time, which keeps an older Xeon Mac Pro inside the
+timeouts. See `X264_PRESET`, `MAX_CONCURRENT_ENCODES` and `ENCODE_TIMEOUT_SECS`.
 
 ### Auto-dubbed audio
 
@@ -249,7 +253,9 @@ easier to shrug off when it is not your real one.
 - `/audio` — switch to audio mode
 - Send a link — bot downloads and sends back the video or audio
 - For long videos the bot asks whether to download as audio or continue as video
-- Downloads are capped at 30s to avoid wasting time on files that exceed Telegram's size limit
+- The link can sit anywhere in the message ("look at this https://youtu.be/…"), or behind a text link
+- Downloads are capped at `DOWNLOAD_TIMEOUT_SECS` (60s by default) in total, to avoid wasting time on files that exceed Telegram's size limit
+- The audio/video buttons expire after 10 minutes and only work for the person who sent the link
 
 In groups, the bot only responds to supported links and stays silent on errors. Make sure **Group Privacy** is turned off in BotFather (`Bot Settings → Group Privacy → Turn off`).
 
@@ -261,6 +267,12 @@ In groups, the bot only responds to supported links and stays silent on errors. 
 | `YTDLP_BIN` | auto-detected | Path to yt-dlp binary |
 | `FFMPEG_BIN` | auto-detected | Path to ffmpeg binary |
 | `FFPROBE_BIN` | auto-detected | Path to ffprobe binary |
-| `DOWNLOAD_TIMEOUT_SECS` | `30` | Max seconds for a single download. Downloads exceeding this are cancelled to keep the bot responsive. |
+| `DOWNLOAD_TIMEOUT_SECS` | `60` | Max seconds for downloading one link, across all attempts. Downloads exceeding this are cancelled to keep the bot responsive. |
+| `ENCODE_TIMEOUT_SECS` | `600` | Max seconds for any single ffmpeg run (convert, shrink, split). |
+| `X264_PRESET` | `veryfast` | x264 preset for re-encodes. `veryfast` suits older Intel Macs; `fast` or `medium` give smaller files on faster CPUs. |
+| `MAX_CONCURRENT_ENCODES` | `1` | How many ffmpeg jobs may run at once. x264 already uses every core, so raising this rarely helps. |
+| `MAX_UPLOAD_MB` | `50` | Largest upload the Bot API accepts. Raise only with a self-hosted Bot API server. |
+| `TELEGRAM_API_URL` | *(unset)* | Self-hosted Bot API server URL. |
+| `*_COOKIES`, `COOKIES_FILE`, `COOKIES_FROM_BROWSER`, `COOKIES_AUTO` | see above | Cookie handling for login-gated posts. |
 | `LONG_VIDEO_SECS` | `300` | Videos longer than this (in seconds) trigger an audio/video choice prompt |
 | `RUST_LOG` | `tgbot=info` | Log level filter |

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use teloxide::prelude::*;
 use teloxide::types::{InputFile, ReplyParameters};
@@ -31,15 +31,118 @@ fn human_mb(bytes: u64) -> u64 {
 }
 
 async fn run_ffmpeg(args: &[&std::ffi::OsStr], config: &Config) -> Result<(), BoxError> {
-    let out = AsyncCommand::new(&config.ffmpeg_bin)
-        .arg("-y")
+    // One encode at a time by default: on an old CPU two parallel x264 runs
+    // each take twice as long and both blow the timeout.
+    let _slot = config.encode_slots.acquire().await?;
+
+    let mut cmd = AsyncCommand::new(&config.ffmpeg_bin);
+    cmd.args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error"])
         .args(args)
-        .output()
-        .await?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn()?;
+    let out = match tokio::time::timeout(config.encode_timeout, child.wait_with_output()).await {
+        Ok(out) => out?,
+        Err(_) => {
+            return Err(format!(
+                "ffmpeg cancelled: encode exceeded {}s limit",
+                config.encode_timeout.as_secs()
+            )
+            .into())
+        }
+    };
     if !out.status.success() {
-        return Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr)).into());
+        return Err(format!("ffmpeg failed: {}", tail(&String::from_utf8_lossy(&out.stderr), 600)).into());
     }
     Ok(())
+}
+
+/// Time left before `deadline`, or a timeout error when it has passed.
+fn remaining(deadline: Instant, total: Duration) -> Result<Duration, BoxError> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left < Duration::from_secs(2) {
+        return Err(format!("yt-dlp cancelled: download exceeded {}s limit", total.as_secs()).into());
+    }
+    Ok(left)
+}
+
+fn is_timeout(e: &BoxError) -> bool {
+    e.to_string().contains("cancelled")
+}
+
+/// Codec name of the first stream of the given kind (`v:0`, `a:0`).
+async fn stream_codec(ffprobe: &Path, path: &Path, selector: &str) -> Option<String> {
+    let out = AsyncCommand::new(ffprobe)
+        .args(["-v", "error", "-select_streams", selector])
+        .args(["-show_entries", "stream=codec_name", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .await
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
+    (out.status.success() && !name.is_empty()).then_some(name)
+}
+
+/// Make a video Telegram will play inline: H.264 + AAC/MP3 in MP4. Each part
+/// that is already right is copied, so most downloads cost a quick remux or
+/// nothing at all; only foreign codecs (VP9, AV1, Opus) are re-encoded.
+async fn telegram_friendly_video(path: &Path, dir: &Path, config: &Config) -> Result<PathBuf, BoxError> {
+    let vcodec = stream_codec(&config.ffprobe_bin, path, "v:0").await;
+    let acodec = stream_codec(&config.ffprobe_bin, path, "a:0").await;
+    let video_ok = vcodec.as_deref() == Some("h264");
+    let audio_ok = matches!(acodec.as_deref(), None | Some("aac") | Some("mp3"));
+    let is_mp4 = matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("mp4") | Some("m4v")
+    );
+    if video_ok && audio_ok && is_mp4 {
+        return Ok(path.to_path_buf());
+    }
+    if vcodec.is_none() {
+        // Could not probe it; let send_video try and fall back to a document.
+        warn!("Could not read the video codec, sending as downloaded");
+        return Ok(path.to_path_buf());
+    }
+
+    info!(
+        "Converting for Telegram (video {} -> {}, audio {} -> {})",
+        vcodec.as_deref().unwrap_or("?"),
+        if video_ok { "copy" } else { "h264" },
+        acodec.as_deref().unwrap_or("none"),
+        if audio_ok { "copy" } else { "aac" },
+    );
+    let dest = dir.join("telegram.mp4");
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-i".into(), path.into(),
+        "-map".into(), "0:v:0".into(),
+        "-map".into(), "0:a:0?".into(),
+    ];
+    if video_ok {
+        args.extend(["-c:v".into(), "copy".into()]);
+    } else {
+        args.extend([
+            "-c:v".into(), "libx264".into(),
+            "-preset".into(), config.x264_preset.as_str().into(),
+            "-crf".into(), "24".into(),
+            "-pix_fmt".into(), "yuv420p".into(),
+            // Never upscale; cap the width at 1280.
+            "-vf".into(), "scale=w='min(1280,iw)':h=-2".into(),
+        ]);
+    }
+    if audio_ok {
+        args.extend(["-c:a".into(), "copy".into()]);
+    } else {
+        args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "128k".into()]);
+    }
+    args.extend(["-movflags".into(), "+faststart".into(), dest.as_os_str().into()]);
+    let argv: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
+    run_ffmpeg(&argv, config).await.map_err(|e| format!("re-encode failed: {e}"))?;
+
+    if file_size(&dest) == 0 {
+        return Err("Re-encoded file is empty".into());
+    }
+    Ok(dest)
 }
 
 // --- Sending -----------------------------------------------------------------
@@ -382,13 +485,21 @@ pub async fn download_and_send_video(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| config.ffmpeg_bin.to_string_lossy().to_string());
 
+    // DOWNLOAD_TIMEOUT_SECS covers both download attempts together, not each.
+    let total = config.download_timeout;
+    let deadline = Instant::now() + total;
+
     let budget = upload_budget(config);
     let budget_mb = human_mb(budget).max(1);
-    // Same "prefer the original audio track" trick as AUDIO_FORMAT, applied to
-    // the audio half of the merge.
+    // H.264 first, so the file usually goes out without any re-encode. The
+    // audio half prefers the original track over YouTube's auto-dubs, as in
+    // AUDIO_FORMAT.
     let preferred_format = format!(
-        "bv[filesize<{budget_mb}M][ext=mp4]+ba[language_preference>=10][filesize<10M]/\
-         bv[filesize<{budget_mb}M][ext=mp4]+ba[filesize<10M]/\
+        "bv[vcodec^=avc1][ext=mp4][filesize<{budget_mb}M]+ba[ext=m4a][language_preference>=10]/\
+         bv[vcodec^=avc1][ext=mp4][filesize<{budget_mb}M]+ba[ext=m4a]/\
+         b[vcodec^=avc1][ext=mp4][filesize<{budget_mb}M]/\
+         bv[ext=mp4][filesize<{budget_mb}M]+ba[language_preference>=10][filesize<10M]/\
+         bv[ext=mp4][filesize<{budget_mb}M]+ba[filesize<10M]/\
          b[ext=mp4]/b"
     );
     let max_filesize = format!("{budget_mb}M");
@@ -404,84 +515,69 @@ pub async fn download_and_send_video(
             "--max-filesize", &max_filesize,
             "-o", &preferred_out_str,
             "--merge-output-format", "mp4",
-            "--postprocessor-args", "-c:v libx264 -preset fast -crf 23 -c:a aac -movflags +faststart",
             "--no-progress",
         ],
         url,
         config,
-        config.download_timeout,
+        remaining(deadline, total)?,
     )
     .await;
 
-    if let Ok(output) = &preferred_result {
-        let aborted = output.contains("Aborting") || output.contains("larger than max-filesize");
-        if !aborted {
-            if let Some(video_path) = find_prefixed_file(tmp.path(), "video.") {
-                let file_len = file_size(&video_path);
-                if file_len > 1024 {
-                    info!("Preferred download succeeded ({file_len} bytes): {url}");
-                    deliver_video(bot, msg, &video_path, tmp.path(), config).await?;
-                    info!("Sent video: {url}");
-                    return Ok(());
+    let downloaded = match &preferred_result {
+        Ok(output) if output.contains("Aborting") || output.contains("larger than max-filesize") => {
+            warn!("Preferred download aborted (file too large)");
+            None
+        }
+        Ok(_) => match find_prefixed_file(tmp.path(), "video.") {
+            Some(p) if file_size(&p) > 1024 => {
+                info!("Preferred download succeeded ({} bytes): {url}", file_size(&p));
+                Some(p)
+            }
+            _ => {
+                warn!("Preferred download produced no usable file");
+                None
+            }
+        },
+        Err(e) => {
+            warn!("Preferred download failed: {e}");
+            None
+        }
+    };
+
+    let video_path = match downloaded {
+        Some(p) => p,
+        None => {
+            // A timed-out first attempt leaves no time for a second, bigger one.
+            if let Err(e) = preferred_result {
+                if is_timeout(&e) {
+                    return Err(e);
                 }
             }
+
+            // --- Fallback download: any format, converted afterwards ---
+            warn!("Trying fallback download: {url}");
+            let fallback_out = tmp.path().join("fallback_video.%(ext)s");
+            let fallback_out_str = fallback_out.to_string_lossy().to_string();
+            run_ytdlp(
+                &[
+                    "--ffmpeg-location", &ffmpeg_dir,
+                    "-f", "bv+ba[language_preference>=10]/bv+ba/b",
+                    "-o", &fallback_out_str,
+                    "--remux-video", "mp4",
+                    "--no-warnings", "--no-progress",
+                ],
+                url,
+                config,
+                remaining(deadline, total)?,
+            )
+            .await?;
+            find_prefixed_file(tmp.path(), "fallback_video").ok_or("Fallback file was not created")?
         }
-    }
+    };
 
-    // --- Fallback download ---
-    match &preferred_result {
-        Err(e) => warn!("Preferred download failed: {e}"),
-        Ok(output) if output.contains("Aborting") => warn!("Preferred download aborted (file too large)"),
-        _ => warn!("Preferred download produced no usable file"),
-    }
-    warn!("Trying fallback download: {url}");
-    let fallback_out = tmp.path().join("fallback_video");
-    let fallback_out_str = fallback_out.to_string_lossy().to_string();
-
-    run_ytdlp(
-        &[
-            "--ffmpeg-location", &ffmpeg_dir,
-            "-f", "bv+ba[language_preference>=10]/bv+ba/b",
-            "-o", &fallback_out_str,
-            "--remux-video", "mp4",
-            "--no-warnings", "--no-progress",
-        ],
-        url,
-        config,
-        config.download_timeout,
-    )
-    .await?;
-
-    let fallback_input = find_prefixed_file(tmp.path(), "fallback_video")
-        .ok_or("Fallback file was not created")?;
-
-    // --- Re-encode with ffmpeg ---
-    let reencoded_out = tmp.path().join("reencoded.mp4");
-    info!("Re-encoding fallback video: {url}");
-    run_ffmpeg(
-        &[
-            "-i".as_ref(), fallback_input.as_ref(),
-            "-c:v".as_ref(), "libx264".as_ref(),
-            "-preset".as_ref(), "fast".as_ref(),
-            "-crf".as_ref(), "24".as_ref(),
-            "-vf".as_ref(), "scale=1280:-2".as_ref(),
-            "-c:a".as_ref(), "aac".as_ref(),
-            "-b:a".as_ref(), "128k".as_ref(),
-            "-movflags".as_ref(), "+faststart".as_ref(),
-            "-f".as_ref(), "mp4".as_ref(),
-            reencoded_out.as_ref(),
-        ],
-        config,
-    )
-    .await
-    .map_err(|e| format!("re-encode failed: {e}"))?;
-
-    if file_size(&reencoded_out) == 0 {
-        return Err("Re-encoded file is empty".into());
-    }
-
-    deliver_video(bot, msg, &reencoded_out, tmp.path(), config).await?;
-    info!("Sent fallback/re-encoded video: {url}");
+    let ready = telegram_friendly_video(&video_path, tmp.path(), config).await?;
+    deliver_video(bot, msg, &ready, tmp.path(), config).await?;
+    info!("Sent video: {url}");
     Ok(())
 }
 
@@ -513,13 +609,19 @@ async fn deliver_video(
         let shrunk = dir.join("fitted.mp4");
         let vb = format!("{video_kbps}k");
         // Cap the height too: a very low bitrate at 1080p looks worse than 480p.
-        let scale = if video_kbps < 500 { "scale=-2:480" } else { "scale=-2:720" };
+        // Never upscale: a 360p source stays 360p.
+        let scale = if video_kbps < 500 {
+            "scale=w=-2:h='min(480,ih)'"
+        } else {
+            "scale=w=-2:h='min(720,ih)'"
+        };
         let r = run_ffmpeg(
             &[
                 "-i".as_ref(), path.as_ref(),
                 "-c:v".as_ref(), "libx264".as_ref(),
-                "-preset".as_ref(), "fast".as_ref(),
+                "-preset".as_ref(), config.x264_preset.as_ref(),
                 "-b:v".as_ref(), vb.as_ref(),
+                "-pix_fmt".as_ref(), "yuv420p".as_ref(),
                 "-maxrate".as_ref(), vb.as_ref(),
                 "-bufsize".as_ref(), format!("{}k", video_kbps * 2).as_ref(),
                 "-vf".as_ref(), scale.as_ref(),
@@ -704,5 +806,67 @@ mod live_check {
             Ok(out) => println!("recovered: {}", out.trim()),
             Err(e) => panic!("still blocked after the cookie retry: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod conversion {
+    use super::*;
+
+    fn config() -> Config {
+        Config::from_env()
+    }
+
+    fn make(dir: &Path, name: &str, vcodec: &str, acodec: &str) -> PathBuf {
+        let out = dir.join(name);
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=25:duration=2"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=2"])
+            .args(["-c:v", vcodec, "-c:a", acodec, "-shortest"])
+            .arg(&out)
+            .status()
+            .expect("ffmpeg must be installed for this test");
+        assert!(status.success());
+        out
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ffmpeg"]
+    async fn h264_aac_mp4_is_sent_untouched() {
+        let dir = TempDir::new().unwrap();
+        let src = make(dir.path(), "a.mp4", "libx264", "aac");
+        let out = telegram_friendly_video(&src, dir.path(), &config()).await.unwrap();
+        assert_eq!(out, src);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ffmpeg"]
+    async fn opus_audio_is_converted_but_video_is_copied() {
+        let dir = TempDir::new().unwrap();
+        let src = make(dir.path(), "b.mp4", "libx264", "libopus");
+        let cfg = config();
+        let out = telegram_friendly_video(&src, dir.path(), &cfg).await.unwrap();
+        assert_ne!(out, src);
+        assert_eq!(stream_codec(&cfg.ffprobe_bin, &out, "v:0").await.as_deref(), Some("h264"));
+        assert_eq!(stream_codec(&cfg.ffprobe_bin, &out, "a:0").await.as_deref(), Some("aac"));
+        // Copied, not rescaled.
+        assert_eq!(helpers_dims(&cfg, &out).await, (Some(1920), Some(1080)));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ffmpeg"]
+    async fn vp9_webm_is_reencoded_and_capped_at_1280() {
+        let dir = TempDir::new().unwrap();
+        let src = make(dir.path(), "c.webm", "libvpx-vp9", "libopus");
+        let cfg = config();
+        let out = telegram_friendly_video(&src, dir.path(), &cfg).await.unwrap();
+        assert_eq!(out.extension().unwrap(), "mp4");
+        assert_eq!(stream_codec(&cfg.ffprobe_bin, &out, "v:0").await.as_deref(), Some("h264"));
+        assert_eq!(helpers_dims(&cfg, &out).await, (Some(1280), Some(720)));
+    }
+
+    async fn helpers_dims(cfg: &Config, p: &Path) -> (Option<u32>, Option<u32>) {
+        video_dimensions(&cfg.ffprobe_bin, p).await
     }
 }
