@@ -4,25 +4,28 @@ use std::time::{Duration, Instant};
 
 use teloxide::prelude::*;
 use teloxide::types::{InputFile, ReplyParameters};
+use teloxide::RequestError;
 use tempfile::TempDir;
 use tokio::process::Command as AsyncCommand;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::gallery::{send_gallery, GalleryFailure};
 use crate::helpers::{
-    detect_browser, find_prefixed_file, is_auth_failure, media_duration, video_dimensions,
-    ytdlp_auth_args,
+    detect_browser, find_prefixed_file, is_auth_failure, is_instagram_post, is_no_video,
+    media_duration, video_dimensions, ytdlp_auth_args,
 };
+use crate::types::Target;
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Leave room for the multipart envelope so a file that measures just under the
 /// cap does not get rejected by the API.
-fn upload_budget(config: &Config) -> u64 {
+pub(crate) fn upload_budget(config: &Config) -> u64 {
     config.max_upload_bytes.saturating_sub(512 * 1024)
 }
 
-fn file_size(path: &Path) -> u64 {
+pub(crate) fn file_size(path: &Path) -> u64 {
     path.metadata().map(|m| m.len()).unwrap_or(0)
 }
 
@@ -30,7 +33,7 @@ fn human_mb(bytes: u64) -> u64 {
     bytes / (1024 * 1024)
 }
 
-async fn run_ffmpeg(args: &[&std::ffi::OsStr], config: &Config) -> Result<(), BoxError> {
+pub(crate) async fn run_ffmpeg(args: &[&std::ffi::OsStr], config: &Config) -> Result<(), BoxError> {
     // One encode at a time by default: on an old CPU two parallel x264 runs
     // each take twice as long and both blow the timeout.
     let _slot = config.encode_slots.acquire().await?;
@@ -58,21 +61,39 @@ async fn run_ffmpeg(args: &[&std::ffi::OsStr], config: &Config) -> Result<(), Bo
     Ok(())
 }
 
-/// Time left before `deadline`, or a timeout error when it has passed.
-fn remaining(deadline: Instant, total: Duration) -> Result<Duration, BoxError> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left < Duration::from_secs(2) {
-        return Err(format!("yt-dlp cancelled: download exceeded {}s limit", total.as_secs()).into());
-    }
-    Ok(left)
+/// The time allowed for fetching one link (DOWNLOAD_TIMEOUT_SECS), shared by
+/// every download attempt for it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Deadline {
+    at: Instant,
+    total: Duration,
 }
 
-fn is_timeout(e: &BoxError) -> bool {
+impl Deadline {
+    pub(crate) fn start(total: Duration) -> Self {
+        Self { at: Instant::now() + total, total }
+    }
+
+    /// Time left, or a timeout error once (almost) none is left.
+    pub(crate) fn left(&self) -> Result<Duration, BoxError> {
+        let left = self.at.saturating_duration_since(Instant::now());
+        if left < Duration::from_secs(2) {
+            return Err(self.expired("download"));
+        }
+        Ok(left)
+    }
+
+    fn expired(&self, what: &str) -> BoxError {
+        format!("{what} cancelled: download exceeded the {}s limit", self.total.as_secs()).into()
+    }
+}
+
+pub(crate) fn is_timeout(e: &BoxError) -> bool {
     e.to_string().contains("cancelled")
 }
 
 /// Codec name of the first stream of the given kind (`v:0`, `a:0`).
-async fn stream_codec(ffprobe: &Path, path: &Path, selector: &str) -> Option<String> {
+pub(crate) async fn stream_codec(ffprobe: &Path, path: &Path, selector: &str) -> Option<String> {
     let out = AsyncCommand::new(ffprobe)
         .args(["-v", "error", "-select_streams", selector])
         .args(["-show_entries", "stream=codec_name", "-of", "csv=p=0"])
@@ -87,7 +108,7 @@ async fn stream_codec(ffprobe: &Path, path: &Path, selector: &str) -> Option<Str
 /// Make a video Telegram will play inline: H.264 + AAC/MP3 in MP4. Each part
 /// that is already right is copied, so most downloads cost a quick remux or
 /// nothing at all; only foreign codecs (VP9, AV1, Opus) are re-encoded.
-async fn telegram_friendly_video(path: &Path, dir: &Path, config: &Config) -> Result<PathBuf, BoxError> {
+pub(crate) async fn telegram_friendly_video(path: &Path, dir: &Path, config: &Config) -> Result<PathBuf, BoxError> {
     let vcodec = stream_codec(&config.ffprobe_bin, path, "v:0").await;
     let acodec = stream_codec(&config.ffprobe_bin, path, "a:0").await;
     let video_ok = vcodec.as_deref() == Some("h264");
@@ -147,36 +168,60 @@ async fn telegram_friendly_video(path: &Path, dir: &Path, config: &Config) -> Re
 
 // --- Sending -----------------------------------------------------------------
 
-async fn send_document_file(
+/// Run a Telegram request, waiting out "429 Too Many Requests" instead of
+/// failing. Telegram allows roughly one message a second per chat and 20 a
+/// minute in groups, and an album counts once per item, so carousels and
+/// multi-part audio are what run into it.
+pub(crate) async fn with_retry<T, F, Fut>(mut send: F) -> Result<T, RequestError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, RequestError>>,
+{
+    const MAX_RETRIES: u32 = 3;
+    let mut retries = 0;
+    loop {
+        match send().await {
+            Err(RequestError::RetryAfter(wait)) if retries < MAX_RETRIES => {
+                retries += 1;
+                let wait = wait.duration() + Duration::from_millis(500);
+                warn!("Telegram flood control, retrying in {}s", wait.as_secs());
+                tokio::time::sleep(wait).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+pub(crate) async fn send_document_file(
     bot: &Bot,
-    msg: &Message,
+    target: &Target,
     path: &Path,
     caption: Option<&str>,
 ) -> Result<(), BoxError> {
-    let mut req = bot.send_document(msg.chat.id, InputFile::file(path.to_path_buf()));
+    let mut req = bot.send_document(target.chat, InputFile::file(path.to_path_buf()));
     if let Some(caption) = caption.filter(|c| !c.is_empty()) {
         req = req.caption(caption);
     }
-    if !msg.chat.is_private() {
-        req = req.reply_parameters(ReplyParameters::new(msg.id));
+    if let Some(id) = target.reply_to {
+        req = req.reply_parameters(ReplyParameters::new(id));
     }
-    req.await?;
+    with_retry(|| req.send_ref()).await?;
     Ok(())
 }
 
-async fn send_video_file(
+pub(crate) async fn send_video_file(
     bot: &Bot,
-    msg: &Message,
+    target: &Target,
     path: &Path,
     config: &Config,
 ) -> Result<(), BoxError> {
     let (w, h) = video_dimensions(&config.ffprobe_bin, path).await;
 
     let mut req = bot
-        .send_video(msg.chat.id, InputFile::file(path.to_path_buf()))
+        .send_video(target.chat, InputFile::file(path.to_path_buf()))
         .supports_streaming(true);
-    if !msg.chat.is_private() {
-        req = req.reply_parameters(ReplyParameters::new(msg.id));
+    if let Some(id) = target.reply_to {
+        req = req.reply_parameters(ReplyParameters::new(id));
     }
     if let Some(w) = w {
         req = req.width(w);
@@ -187,36 +232,36 @@ async fn send_video_file(
 
     // Telegram rejects anything it cannot treat as a playable video (odd codec,
     // odd container). Falling back to a plain document still gets the file there.
-    if let Err(e) = req.await {
+    if let Err(e) = with_retry(|| req.send_ref()).await {
         warn!("send_video failed ({e}), retrying as document");
-        send_document_file(bot, msg, path, None).await?;
+        send_document_file(bot, target, path, None).await?;
     }
     Ok(())
 }
 
 async fn send_audio_file(
     bot: &Bot,
-    msg: &Message,
+    target: &Target,
     path: &Path,
     title: &str,
     config: &Config,
 ) -> Result<(), BoxError> {
-    let mut req = bot.send_audio(msg.chat.id, InputFile::file(path.to_path_buf()));
+    let mut req = bot.send_audio(target.chat, InputFile::file(path.to_path_buf()));
     if !title.is_empty() {
         req = req.title(title);
     }
     if let Some(secs) = media_duration(&config.ffprobe_bin, path).await {
         req = req.duration(secs as u32);
     }
-    if !msg.chat.is_private() {
-        req = req.reply_parameters(ReplyParameters::new(msg.id));
+    if let Some(id) = target.reply_to {
+        req = req.reply_parameters(ReplyParameters::new(id));
     }
 
     // sendAudio only accepts MP3/M4A; anything else (or an oversized upload)
     // errors out, and a document keeps the file usable either way.
-    if let Err(e) = req.await {
+    if let Err(e) = with_retry(|| req.send_ref()).await {
         warn!("send_audio failed ({e}), retrying as document");
-        send_document_file(bot, msg, path, Some(title)).await?;
+        send_document_file(bot, target, path, Some(title)).await?;
     }
     Ok(())
 }
@@ -368,7 +413,7 @@ async fn split_media(
 
 /// Last `max_chars` characters, cut at a line boundary. yt-dlp puts the fatal
 /// ERROR line last, so the tail is the part worth reporting.
-fn tail(text: &str, max_chars: usize) -> String {
+pub(crate) fn tail(text: &str, max_chars: usize) -> String {
     let text = text.trim();
     let count = text.chars().count();
     if count <= max_chars {
@@ -381,36 +426,100 @@ fn tail(text: &str, max_chars: usize) -> String {
     }
 }
 
-// --- yt-dlp ------------------------------------------------------------------
+// --- External downloaders ----------------------------------------------------
+
+/// What a yt-dlp or gallery-dl run produced. Only a failure to start and a
+/// timeout are errors here; a non-zero exit shows up in `success`, so the
+/// caller can still look at whatever was downloaded.
+pub(crate) struct ToolOutput {
+    pub success: bool,
+    pub status: std::process::ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl ToolOutput {
+    /// The end of whichever stream carries the error, which is where the fatal
+    /// message is.
+    pub(crate) fn failure_detail(&self) -> String {
+        let detail = if self.stderr.trim().is_empty() { &self.stdout } else { &self.stderr };
+        tail(detail, 1200)
+    }
+}
+
+pub(crate) async fn run_tool(
+    name: &str,
+    bin: &Path,
+    args: &[&str],
+    extra: &[String],
+    url: &str,
+    deadline: Deadline,
+) -> Result<ToolOutput, BoxError> {
+    let timeout = deadline.left()?;
+    let mut cmd = AsyncCommand::new(bin);
+    cmd.args(args).args(extra).arg(url).kill_on_drop(true);
+    // Without explicit pipes the child inherits our stdio and wait_with_output()
+    // hands back empty buffers — which silently blinds every check we make on
+    // the tool's output.
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("{name} could not be started ({}): {e}", bin.display()))?;
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(out)) => Ok(ToolOutput {
+            success: out.status.success(),
+            status: out.status,
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }),
+        Ok(Err(e)) => Err(format!("{name} io error: {e}").into()),
+        Err(_) => Err(deadline.expired(name)),
+    }
+}
+
+/// The browser to take cookies from for a second attempt, if one makes sense:
+/// no cookies were used the first time, automatic cookies are on, the first
+/// attempt hit a login wall, and a browser profile exists on disk.
+pub(crate) fn cookie_retry_browser(
+    auth: &[String],
+    config: &Config,
+    login_wall: bool,
+    url: &str,
+) -> Option<&'static str> {
+    let have_cookies = auth
+        .iter()
+        .any(|a| a == "--cookies" || a == "--cookies-from-browser");
+    if have_cookies || !config.cookies_auto || !login_wall {
+        return None;
+    }
+    let browser = detect_browser();
+    match browser {
+        Some(b) => warn!("{url} hit a login wall, retrying with cookies from {b}"),
+        None => warn!("{url} needs a login and no browser profile was found for cookies"),
+    }
+    browser
+}
 
 async fn run_ytdlp(
     args: &[&str],
     url: &str,
     config: &Config,
-    timeout: Duration,
+    deadline: Deadline,
 ) -> Result<String, BoxError> {
     let auth = ytdlp_auth_args(url, config);
-    let have_cookies = auth
-        .iter()
-        .any(|a| a == "--cookies" || a == "--cookies-from-browser");
-
-    let first = spawn_ytdlp(args, &auth, url, config, timeout).await;
+    let first = spawn_ytdlp(args, &auth, url, config, deadline).await;
 
     // Nothing to retry with if cookies were already in play, or if the failure
     // was not a login wall in the first place.
     let Err(e) = first else { return first };
-    if have_cookies || !config.cookies_auto || !is_auth_failure(&e.to_string()) {
-        return Err(e);
-    }
-    let Some(browser) = detect_browser() else {
-        warn!("{url} needs a login and no browser profile was found for cookies");
+    let wall = is_auth_failure(&e.to_string());
+    let Some(browser) = cookie_retry_browser(&auth, config, wall, url) else {
         return Err(e);
     };
-
-    warn!("{url} hit a login wall, retrying with cookies from {browser}");
     let mut retry = vec!["--cookies-from-browser".to_string(), browser.to_string()];
     retry.extend(auth);
-    spawn_ytdlp(args, &retry, url, config, timeout)
+    spawn_ytdlp(args, &retry, url, config, deadline)
         .await
         // Report the original failure: the retry error is usually just
         // "could not find cookies database", which is less useful.
@@ -425,41 +534,13 @@ async fn spawn_ytdlp(
     extra: &[String],
     url: &str,
     config: &Config,
-    timeout: Duration,
+    deadline: Deadline,
 ) -> Result<String, BoxError> {
-    let mut cmd = AsyncCommand::new(&config.ytdlp_bin);
-    cmd.args(args);
-    for arg in extra {
-        cmd.arg(arg);
+    let out = run_tool("yt-dlp", &config.ytdlp_bin, args, extra, url, deadline).await?;
+    if !out.success {
+        return Err(format!("yt-dlp failed ({}): {}", out.status, out.failure_detail()).into());
     }
-    cmd.arg(url);
-    cmd.kill_on_drop(true);
-    // Without explicit pipes the child inherits our stdio and wait_with_output()
-    // hands back empty buffers — which silently blinds every check we make on
-    // yt-dlp's output below.
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let child = cmd.spawn()?;
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-
-    match result {
-        Ok(Ok(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            if !output.status.success() {
-                let detail = if stderr.trim().is_empty() { &stdout } else { &stderr };
-                return Err(
-                    format!("yt-dlp failed ({}): {}", output.status, tail(detail, 1200)).into(),
-                );
-            }
-            Ok(format!("{stderr}\n{stdout}"))
-        }
-        Ok(Err(e)) => Err(format!("yt-dlp io error: {e}").into()),
-        Err(_) => {
-            Err(format!("yt-dlp cancelled: download exceeded {}s limit", timeout.as_secs()).into())
-        }
-    }
+    Ok(format!("{}\n{}", out.stderr, out.stdout))
 }
 
 /// Audio track selector. `language_preference>=10` is how yt-dlp marks YouTube's
@@ -480,14 +561,70 @@ pub async fn download_and_send_video(
     url: &str,
     config: &Config,
 ) -> Result<(), BoxError> {
+    let target = Target::of(msg);
+    // DOWNLOAD_TIMEOUT_SECS covers every download attempt for the link together.
+    let deadline = Deadline::start(config.download_timeout);
+
+    // An Instagram post can be photos, a video, or a carousel of both. yt-dlp
+    // only sees the videos; gallery-dl fetches everything.
+    let mut gallery_error = None;
+    if is_instagram_post(url) {
+        match send_gallery(bot, &target, url, config, deadline).await {
+            Ok(()) => return Ok(()),
+            Err(GalleryFailure::Unavailable) => {
+                warn!("gallery-dl is not installed, so photos in Instagram posts cannot be fetched");
+            }
+            Err(GalleryFailure::Failed(e)) => {
+                if is_timeout(&e) {
+                    return Err(e);
+                }
+                warn!("gallery-dl failed for {url} ({e}), trying yt-dlp");
+                gallery_error = Some(e);
+            }
+        }
+    }
+
+    match video_via_ytdlp(bot, &target, url, config, deadline).await {
+        // No video at all, so most likely a photo post: send the photos.
+        Err(e) if is_no_video(&e.to_string()) => match gallery_error {
+            Some(gallery_error) => Err(gallery_error),
+            None => photos_instead(bot, &target, url, config, deadline, e).await,
+        },
+        result => result,
+    }
+}
+
+/// For a link yt-dlp found no video in: fetch it as a photo post instead.
+async fn photos_instead(
+    bot: &Bot,
+    target: &Target,
+    url: &str,
+    config: &Config,
+    deadline: Deadline,
+    no_video: BoxError,
+) -> Result<(), BoxError> {
+    info!("No video in {url}, trying it as a photo post");
+    match send_gallery(bot, target, url, config, deadline).await {
+        Ok(()) => Ok(()),
+        Err(GalleryFailure::Unavailable) => {
+            warn!("Photos need gallery-dl, which is not installed: {no_video}");
+            Err("У овом посту нема видеа, а за слике на серверу треба инсталирати gallery-dl.".into())
+        }
+        Err(GalleryFailure::Failed(e)) => Err(e),
+    }
+}
+
+async fn video_via_ytdlp(
+    bot: &Bot,
+    target: &Target,
+    url: &str,
+    config: &Config,
+    deadline: Deadline,
+) -> Result<(), BoxError> {
     let tmp = TempDir::new()?;
     let ffmpeg_dir = config.ffmpeg_bin.parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| config.ffmpeg_bin.to_string_lossy().to_string());
-
-    // DOWNLOAD_TIMEOUT_SECS covers both download attempts together, not each.
-    let total = config.download_timeout;
-    let deadline = Instant::now() + total;
 
     let budget = upload_budget(config);
     let budget_mb = human_mb(budget).max(1);
@@ -519,7 +656,7 @@ pub async fn download_and_send_video(
         ],
         url,
         config,
-        remaining(deadline, total)?,
+        deadline,
     )
     .await;
 
@@ -547,9 +684,10 @@ pub async fn download_and_send_video(
     let video_path = match downloaded {
         Some(p) => p,
         None => {
-            // A timed-out first attempt leaves no time for a second, bigger one.
             if let Err(e) = preferred_result {
-                if is_timeout(&e) {
+                // A timed-out first attempt leaves no time for a second, bigger
+                // one, and a post with no video has nothing for it to find.
+                if is_timeout(&e) || is_no_video(&e.to_string()) {
                     return Err(e);
                 }
             }
@@ -568,7 +706,7 @@ pub async fn download_and_send_video(
                 ],
                 url,
                 config,
-                remaining(deadline, total)?,
+                deadline,
             )
             .await?;
             find_prefixed_file(tmp.path(), "fallback_video").ok_or("Fallback file was not created")?
@@ -576,22 +714,18 @@ pub async fn download_and_send_video(
     };
 
     let ready = telegram_friendly_video(&video_path, tmp.path(), config).await?;
-    deliver_video(bot, msg, &ready, tmp.path(), config).await?;
+    let fitted = fit_video(&ready, tmp.path(), config).await?;
+    send_video_file(bot, target, &fitted, config).await?;
     info!("Sent video: {url}");
     Ok(())
 }
 
-/// Send a finished video, squeezing it under the upload limit first if needed.
-async fn deliver_video(
-    bot: &Bot,
-    msg: &Message,
-    path: &Path,
-    dir: &Path,
-    config: &Config,
-) -> Result<(), BoxError> {
+/// A version of the video that fits the upload limit: the file itself when it
+/// already does, otherwise a smaller re-encode written to `dir`.
+pub(crate) async fn fit_video(path: &Path, dir: &Path, config: &Config) -> Result<PathBuf, BoxError> {
     let budget = upload_budget(config);
     if file_size(path) <= budget {
-        return send_video_file(bot, msg, path, config).await;
+        return Ok(path.to_path_buf());
     }
 
     let size = file_size(path);
@@ -636,7 +770,7 @@ async fn deliver_video(
 
         match r {
             Ok(()) if file_size(&shrunk) > 0 && file_size(&shrunk) <= budget => {
-                return send_video_file(bot, msg, &shrunk, config).await;
+                return Ok(shrunk);
             }
             Ok(()) => warn!("Re-encoded video still over the limit"),
             Err(e) => warn!("Shrinking video failed: {e}"),
@@ -657,6 +791,24 @@ pub async fn download_and_send_audio(
     url: &str,
     config: &Config,
 ) -> Result<(), BoxError> {
+    let target = Target::of(msg);
+    let deadline = Deadline::start(config.download_timeout);
+    match audio_via_ytdlp(bot, &target, url, config, deadline).await {
+        // A photo post has no sound to extract; the photos are the next best thing.
+        Err(e) if is_no_video(&e.to_string()) => {
+            photos_instead(bot, &target, url, config, deadline, e).await
+        }
+        result => result,
+    }
+}
+
+async fn audio_via_ytdlp(
+    bot: &Bot,
+    target: &Target,
+    url: &str,
+    config: &Config,
+    deadline: Deadline,
+) -> Result<(), BoxError> {
     let tmp = TempDir::new()?;
     let audio_out = tmp.path().join("audio.%(ext)s");
     let audio_out_str = audio_out.to_string_lossy().to_string();
@@ -673,7 +825,7 @@ pub async fn download_and_send_audio(
         ],
         url,
         config,
-        config.download_timeout,
+        deadline,
     )
     .await?;
 
@@ -698,7 +850,7 @@ pub async fn download_and_send_audio(
         }
     };
 
-    deliver_audio(bot, msg, &named_path, title, tmp.path(), config).await?;
+    deliver_audio(bot, target, &named_path, title, tmp.path(), config).await?;
     info!("Sent audio: {url}");
     Ok(())
 }
@@ -707,7 +859,7 @@ pub async fn download_and_send_audio(
 /// and split into numbered parts when even that is not enough.
 async fn deliver_audio(
     bot: &Bot,
-    msg: &Message,
+    target: &Target,
     path: &Path,
     title: &str,
     dir: &Path,
@@ -721,7 +873,7 @@ async fn deliver_audio(
     let budget = upload_budget(config);
     let size = file_size(path);
     if size <= budget {
-        return send_audio_file(bot, msg, path, title, config).await;
+        return send_audio_file(bot, target, path, title, config).await;
     }
 
     warn!(
@@ -734,7 +886,7 @@ async fn deliver_audio(
     let shrunk_dir = dir.join("shrunk");
     std::fs::create_dir_all(&shrunk_dir)?;
     if let Some(shrunk) = shrink_audio(path, &shrunk_dir, title, duration, config).await? {
-        return send_audio_file(bot, msg, &shrunk, title, config).await;
+        return send_audio_file(bot, target, &shrunk, title, config).await;
     }
 
     // Too long to fit at any sane bitrate — encode at the floor, then split.
@@ -761,7 +913,7 @@ async fn deliver_audio(
     info!("Sending audio in {total} parts");
     for (i, part) in parts.iter().enumerate() {
         let part_title = format!("{title} ({}/{total})", i + 1);
-        send_audio_file(bot, msg, part, &part_title, config).await?;
+        send_audio_file(bot, target, part, &part_title, config).await?;
     }
     Ok(())
 }
@@ -798,7 +950,7 @@ mod live_check {
             &["--no-download", "--print", "%(id)s"],
             &url,
             &config,
-            Duration::from_secs(90),
+            Deadline::start(Duration::from_secs(90)),
         )
         .await;
 
@@ -870,3 +1022,4 @@ mod conversion {
         video_dimensions(&cfg.ffprobe_bin, p).await
     }
 }
+

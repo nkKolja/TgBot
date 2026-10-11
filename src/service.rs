@@ -139,62 +139,103 @@ fn find_brew() -> Option<PathBuf> {
     None
 }
 
+/// Homebrew ships no ready-made packages for macOS 12 and older ("Tier 3"), so
+/// `brew upgrade` there compiles from source: LLVM, Rust and Python for a tool
+/// like gallery-dl, which takes hours on old hardware and often fails anyway.
+fn brew_builds_from_source() -> bool {
+    Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .split('.')
+                .next()?
+                .parse::<u32>()
+                .ok()
+        })
+        .is_some_and(|major| major <= 12)
+}
+
+/// Whether `manager` lists `name` among what it installed. `brew list
+/// --versions NAME` prints a line only when brew owns NAME; `uv tool list`
+/// prints one "NAME vX.Y" line per installed tool.
+fn owns(manager: &Path, args: &[&str], name: &str) -> bool {
+    Command::new(manager)
+        .args(args)
+        .output()
+        .map(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(name))
+        })
+        .unwrap_or(false)
+}
+
+fn run_step(program: &Path, args: &[&str], label: &str) {
+    println!("  {} {}", program.file_name().unwrap_or_default().to_string_lossy(), args.join(" "));
+    match Command::new(program).args(args).status() {
+        Ok(s) if s.success() => println!("  {label}: ok"),
+        Ok(s) => eprintln!("  {label}: exited with {s} (may already be the latest)"),
+        Err(e) => eprintln!("  {label}: failed to run: {e}"),
+    }
+}
+
+/// Update yt-dlp or gallery-dl through whatever installed it.
+fn update_downloader(name: &str, brew: Option<&Path>, old_macos: bool, uv: Option<&Path>) {
+    if let Some(brew) = brew.filter(|b| owns(b, &["list", "--versions", name], name)) {
+        if old_macos {
+            println!("  {name} comes from Homebrew, which cannot update it on this macOS.");
+            println!("  Switch it to uv: brew uninstall {name} && uv tool install --python 3.13 {name}");
+        } else {
+            run_step(brew, &["upgrade", name], name);
+        }
+        return;
+    }
+    if let Some(uv) = uv.filter(|uv| owns(uv, &["tool", "list"], name)) {
+        run_step(uv, &["tool", "upgrade", name], name);
+        return;
+    }
+    let bin = crate::config::which(name);
+    if !bin.is_file() {
+        println!("  {name} is not installed");
+        return;
+    }
+    if name == "yt-dlp" {
+        // Standalone binary or pip: yt-dlp updates itself.
+        run_step(&bin, &["--update"], name);
+    } else {
+        println!("  {name} was not installed by Homebrew or uv; update it the way it was installed");
+        println!("  (for example: pip install -U {name})");
+    }
+}
+
 fn update_tools() {
     println!("Updating external tools...");
 
     let brew = find_brew();
+    let old_macos = brew.is_some() && brew_builds_from_source();
+    if old_macos {
+        println!("  macOS 12 or older: Homebrew would compile updates from source, so brew upgrades are skipped");
+    }
+    let uv = Some(crate::config::which("uv")).filter(|p| p.is_file());
 
-    // Resolve yt-dlp the same way config.rs does
-    let home = env::var("HOME").unwrap_or_default();
-    let ytdlp = [
-        "/opt/homebrew/bin/yt-dlp",
-        "/usr/local/bin/yt-dlp",
-        &format!("{home}/.local/bin/yt-dlp"),
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.exists())
-    .unwrap_or_else(|| PathBuf::from("yt-dlp"));
-
-    // Ask brew whether it owns yt-dlp rather than guessing from the path:
-    // /usr/local/bin is brew's prefix on Intel Macs but also where standalone
-    // installs land, and brew may not be installed at all.
-    let brew_ytdlp = brew.as_ref().filter(|brew| {
-        Command::new(brew)
-            .args(["list", "--versions", "yt-dlp"])
-            .output()
-            .map(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
-            .unwrap_or(false)
-    });
-
-    if let Some(brew) = brew_ytdlp {
-        // brew-managed: `yt-dlp --update` won't work
-        println!("  brew upgrade yt-dlp");
-        match Command::new(brew).args(["upgrade", "yt-dlp"]).status() {
-            Ok(s) if s.success() => println!("  yt-dlp: ok"),
-            Ok(s) => eprintln!("  brew upgrade yt-dlp exited with {s} (may already be latest)"),
-            Err(e) => eprintln!("  brew upgrade yt-dlp failed: {e}"),
-        }
-    } else {
-        // pip / pipx / standalone: self-update
-        println!("  yt-dlp --update");
-        match Command::new(&ytdlp).arg("--update").status() {
-            Ok(s) if s.success() => println!("  yt-dlp: ok"),
-            Ok(s) => eprintln!("  yt-dlp --update exited with {s}"),
-            Err(e) => eprintln!("  yt-dlp --update failed: {e}"),
-        }
+    update_downloader("yt-dlp", brew.as_deref(), old_macos, uv.as_deref());
+    // gallery-dl fetches photo posts. Sites change often enough that an old
+    // copy stops working, so it is kept current along with yt-dlp.
+    update_downloader("gallery-dl", brew.as_deref(), old_macos, uv.as_deref());
+    if !crate::config::which("gallery-dl").is_file() {
+        println!("  Photo posts need gallery-dl: brew install gallery-dl");
+        println!("  (on macOS 12 or older: uv tool install --python 3.13 gallery-dl)");
     }
 
-    // brew upgrade ffmpeg (ffprobe is part of the ffmpeg package)
-    if let Some(brew) = &brew {
-        println!("  brew upgrade ffmpeg");
-        match Command::new(brew).args(["upgrade", "ffmpeg"]).status() {
-            Ok(s) if s.success() => println!("  ffmpeg/ffprobe: ok"),
-            Ok(s) => eprintln!("  brew upgrade ffmpeg exited with {s} (may already be latest)"),
-            Err(e) => eprintln!("  brew upgrade ffmpeg failed: {e}"),
-        }
-    } else {
-        println!("  brew not found, skipping ffmpeg update");
+    // ffmpeg/ffprobe come from Homebrew when they come from a package manager at all.
+    match &brew {
+        Some(brew) if !old_macos => run_step(brew, &["upgrade", "ffmpeg"], "ffmpeg/ffprobe"),
+        Some(_) => println!("  ffmpeg: skipped (Homebrew cannot update it on this macOS)"),
+        None => println!("  brew not found, skipping ffmpeg update"),
     }
 
     println!();
@@ -261,4 +302,29 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn ownership_is_read_from_the_package_manager_listing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fake = dir.path().join("fake-uv");
+        // What `uv tool list` prints.
+        fs::write(
+            &fake,
+            "#!/bin/sh\nprintf 'gallery-dl v1.32.16\\n- gallery-dl\\nyt-dlp v2026.6.9\\n- yt-dlp\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(owns(&fake, &["tool", "list"], "gallery-dl"));
+        assert!(owns(&fake, &["tool", "list"], "yt-dlp"));
+        assert!(!owns(&fake, &["tool", "list"], "ffmpeg"));
+        assert!(!owns(&fake, &["tool", "list"], "gallery"));
+        assert!(!owns(&dir.path().join("missing"), &["tool", "list"], "yt-dlp"));
+    }
 }

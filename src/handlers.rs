@@ -8,8 +8,8 @@ use tracing::{error, info};
 use crate::config::Config;
 use crate::download::{download_and_send_audio, download_and_send_video};
 use crate::helpers::{
-    capitalize_first, extract_supported_url, get_video_duration, random_greeting, supported_url,
-    user_facing_error,
+    capitalize_first, extract_supported_url, get_video_duration, is_instagram_post,
+    random_greeting, supported_url, user_facing_error,
 };
 use crate::types::{Cmd, Mode, Pending, PendingDownloads, UserModes, PENDING_TTL};
 
@@ -99,7 +99,9 @@ pub async fn handle_message(
     info!("Valid URL detected: mode={mode:?}, url={url}");
 
     // Long videos: offer audio instead before spending time on a big download.
-    if matches!(mode, Mode::Video) {
+    // Instagram posts skip this: they are mostly photos, and asking yt-dlp for
+    // the length of a photo post only wastes a request.
+    if matches!(mode, Mode::Video) && !is_instagram_post(&url) {
         if let Some(duration) = get_video_duration(&url, &config).await {
             if duration > config.long_video_secs {
                 let mins = (duration / 60.0).ceil() as u64;

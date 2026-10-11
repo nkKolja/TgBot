@@ -86,6 +86,9 @@ pub struct Config {
     pub ytdlp_bin: PathBuf,
     pub ffmpeg_bin: PathBuf,
     pub ffprobe_bin: PathBuf,
+    /// gallery-dl, for photo posts and carousels. Optional: without it photo
+    /// posts fail as before.
+    pub gallery_dl_bin: PathBuf,
     pub download_timeout: Duration,
     pub long_video_secs: f64,
     /// Largest file the Bot API will accept from us. 50 MB on api.telegram.org,
@@ -139,6 +142,9 @@ impl Config {
             ffprobe_bin: std::env::var("FFPROBE_BIN")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| which("ffprobe")),
+            gallery_dl_bin: std::env::var("GALLERY_DL_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| which("gallery-dl")),
             download_timeout: Duration::from_secs(timeout_secs),
             long_video_secs,
             max_upload_bytes: max_upload_mb * 1024 * 1024,
@@ -168,7 +174,7 @@ impl Config {
     }
 }
 
-fn which(name: &str) -> PathBuf {
+pub(crate) fn which(name: &str) -> PathBuf {
     // Try the system `which` first (works when PATH is correct).
     if let Some(p) = std::process::Command::new("which")
         .arg(name)
