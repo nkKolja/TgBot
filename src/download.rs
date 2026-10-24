@@ -282,57 +282,87 @@ fn titled_path(dir: &Path, title: &str, fallback: &str, ext: &str) -> PathBuf {
     dir.join(format!("{stem}.{ext}"))
 }
 
-/// Loudness target for every audio file the bot sends. Some sources are
-/// mastered far below streaming level (YouTube serves such uploads untouched and
-/// only boosts them in its own player), so the raw track plays very quietly on a
-/// phone. -16 LUFS is the usual target for speech and mobile listening.
+/// Audio quieter than this gets the loudness fallback. Normal streaming audio
+/// sits around -14 to -18 LUFS; badly mastered uploads can be -29 or lower.
+const QUIET_LUFS: f64 = -24.0;
+/// Level the fallback boosts quiet audio to.
 const TARGET_LUFS: f64 = -16.0;
 
-const AUDIO_SAMPLE_RATE: &str = "48000";
+/// YouTube's "stable volume" (DRC) audio streams, which yt-dlp names
+/// `<itag>-drc`. They are compressed and much louder than the original track.
+fn drc_audio_format(budget_mb: u64) -> String {
+    let mut alts = Vec::new();
+    for base in ["ba[format_id$=-drc][language_preference>=10]", "ba[format_id$=-drc]"] {
+        for size in ["filesize", "filesize_approx"] {
+            alts.push(format!("{base}[ext=m4a][{size}<{budget_mb}M]"));
+        }
+    }
+    alts.join("/")
+}
 
-/// Measure integrated loudness (EBU R128) with a decode-only ffmpeg pass. This
-/// is several times faster than ffmpeg's `loudnorm`, which resamples to 192 kHz.
-async fn measure_loudness(src: &Path, config: &Config) -> Option<f64> {
-    let child = AsyncCommand::new(&config.ffmpeg_bin)
-        .args(["-nostdin", "-hide_banner", "-nostats", "-i"])
+fn is_youtube(url: &str) -> bool {
+    let host = url.split("://").nth(1).unwrap_or(url).split(['/', '?']).next().unwrap_or("");
+    let host = host.strip_prefix("www.").or_else(|| host.strip_prefix("m.")).unwrap_or(host);
+    matches!(host, "youtube.com" | "youtu.be" | "music.youtube.com")
+}
+
+/// macOS ffmpeg builds usually include Apple's AudioToolbox AAC encoder, which
+/// is several times faster than ffmpeg's own on an old CPU. Checked once.
+fn aac_encoder(config: &Config) -> &'static str {
+    static ENCODER: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    ENCODER.get_or_init(|| {
+        let has_at = std::process::Command::new(&config.ffmpeg_bin)
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(" aac_at "))
+            .unwrap_or(false);
+        let enc = if has_at { "aac_at" } else { "aac" };
+        info!("Using AAC encoder: {enc}");
+        enc
+    })
+}
+
+/// Integrated loudness (EBU R128) of up to 10 minutes of the file, skipping the
+/// first minute of longer files (intros are often music or silence). Decode
+/// only, so it takes about a second.
+async fn sample_loudness(src: &Path, config: &Config) -> Option<f64> {
+    let duration = media_duration(&config.ffprobe_bin, src).await.unwrap_or(0.0);
+    let mut cmd = AsyncCommand::new(&config.ffmpeg_bin);
+    cmd.args(["-nostdin", "-hide_banner", "-nostats"]);
+    if duration > 180.0 {
+        cmd.args(["-ss", "60"]);
+    }
+    cmd.args(["-t", "600", "-i"])
         .arg(src)
         .args(["-vn", "-af", "ebur128", "-f", "null", "-"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .ok()?;
-    let out = tokio::time::timeout(config.encode_timeout, child.wait_with_output())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(60), cmd.spawn().ok()?.wait_with_output())
         .await
         .ok()?
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    // The summary is printed last; its first "I:" line is the integrated value.
+    // The summary comes last; its first "I:" line is the integrated loudness.
     let stderr = String::from_utf8_lossy(&out.stderr);
     let summary = &stderr[stderr.rfind("Summary:")?..];
-    summary
+    let lufs: f64 = summary
         .lines()
-        .find_map(|l| l.trim().strip_prefix("I:"))
-        .and_then(|v| v.trim().trim_end_matches("LUFS").trim().parse().ok())
+        .find_map(|l| l.trim().strip_prefix("I:"))?
+        .trim()
+        .trim_end_matches("LUFS")
+        .trim()
+        .parse()
+        .ok()?;
+    // -70 is what ebur128 reports for silence.
+    (lufs > -60.0).then_some(lufs)
 }
 
-/// Filter that brings `src` to TARGET_LUFS: a fixed gain plus a peak limiter at
-/// about -1.5 dBFS so the boost does not clip. Falls back to a pass-through
-/// when loudness cannot be measured or the track is silent.
-async fn loudness_filter(src: &Path, config: &Config) -> String {
-    match measure_loudness(src, config).await {
-        Some(lufs) if lufs > -60.0 => {
-            let gain = (TARGET_LUFS - lufs).clamp(-20.0, 30.0);
-            info!("Audio loudness {lufs:.1} LUFS, applying {gain:+.1} dB");
-            format!("volume={gain:.2}dB,alimiter=limit=0.84:level=false")
-        }
-        other => {
-            warn!("Could not measure loudness ({other:?}), leaving level unchanged");
-            "anull".to_string()
-        }
-    }
+/// Gain plus a peak limiter at about -1.5 dBFS so the boost does not clip.
+fn boost_filter(gain_db: f64) -> String {
+    format!("volume={gain_db:.2}dB,alimiter=limit=0.84:level=false")
 }
 
 /// Re-encode audio at whatever bitrate fits the upload budget. Returns `None`
@@ -367,8 +397,7 @@ async fn shrink_audio(
             "-i".as_ref(), src.as_ref(),
             "-vn".as_ref(),
             "-af".as_ref(), filter.as_ref(),
-            "-ar".as_ref(), AUDIO_SAMPLE_RATE.as_ref(),
-            "-c:a".as_ref(), "aac".as_ref(),
+            "-c:a".as_ref(), aac_encoder(config).as_ref(),
             "-b:a".as_ref(), bitrate.as_ref(),
             "-ac".as_ref(), channels.as_ref(),
             "-movflags".as_ref(), "+faststart".as_ref(),
@@ -384,27 +413,35 @@ async fn shrink_audio(
     Ok(Some(dest))
 }
 
-/// Encode to M4A at `bitrate_kbps` with loudness normalisation. This also turns containers
-/// Telegram will not play as audio (opus/webm, for instance) into M4A. Returns
-/// the original path if the encode fails, so the user still gets something.
+/// Re-encode to M4A when the container is something Telegram will not play as
+/// audio (opus/webm, for instance), or when `boost` asks for a level change.
+/// Returns the original path if it is already fine or if the encode fails.
 async fn normalize_audio(
     src: &Path,
     dir: &Path,
     title: &str,
-    bitrate_kbps: u64,
-    filter: &str,
+    boost: Option<(&str, u64)>,
     config: &Config,
 ) -> PathBuf {
-    let bitrate = format!("{bitrate_kbps}k");
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if boost.is_none() && matches!(ext.as_str(), "mp3" | "m4a" | "mp4" | "aac") {
+        return src.to_path_buf();
+    }
+    let (filter, kbps) = boost.unwrap_or(("anull", 128));
+    let bitrate = format!("{kbps}k");
+
     let dest = titled_path(dir, title, "audio", "m4a");
-    info!("Normalising loudness and encoding audio to m4a");
+    info!("Encoding .{ext} audio to {kbps}k m4a for Telegram (filter: {filter})");
     match run_ffmpeg(
         &[
             "-i".as_ref(), src.as_ref(),
             "-vn".as_ref(),
             "-af".as_ref(), filter.as_ref(),
-            "-ar".as_ref(), AUDIO_SAMPLE_RATE.as_ref(),
-            "-c:a".as_ref(), "aac".as_ref(),
+            "-c:a".as_ref(), aac_encoder(config).as_ref(),
             "-b:a".as_ref(), bitrate.as_ref(),
             "-movflags".as_ref(), "+faststart".as_ref(),
             dest.as_ref(),
@@ -907,59 +944,127 @@ async fn audio_via_ytdlp(
         }
     };
 
-    deliver_audio(bot, target, &named_path, title, tmp.path(), config).await?;
+    let (audio, boost_db) = quiet_fallback(named_path, url, title, tmp.path(), config, deadline).await;
+    deliver_audio(bot, target, &audio, title, tmp.path(), boost_db, config).await?;
     info!("Sent audio: {url}");
     Ok(())
 }
 
-/// Send finished audio, always loudness-normalised: at up to 128k (never above
-/// the source bitrate) when that fits,
-/// re-encoded smaller when it does not, and split into numbered parts when even
-/// that is not enough. Every encode starts from the downloaded original, so the
-/// audio is never transcoded twice.
+/// Only for audio well below normal level. On YouTube, first fetch the louder
+/// DRC stream (a second quick download, no encoding). If there is none that
+/// fits, or the audio is still quiet, return the gain the encode should apply.
+async fn quiet_fallback(
+    path: PathBuf,
+    url: &str,
+    title: &str,
+    dir: &Path,
+    config: &Config,
+    deadline: Deadline,
+) -> (PathBuf, Option<f64>) {
+    let Some(lufs) = sample_loudness(&path, config).await else {
+        return (path, None);
+    };
+    if lufs >= QUIET_LUFS {
+        return (path, None);
+    }
+    info!("Audio is quiet ({lufs:.1} LUFS)");
+
+    let (mut path, mut lufs) = (path, lufs);
+    if is_youtube(url) {
+        if let Some(drc) = download_drc(url, title, dir, config, deadline).await {
+            match sample_loudness(&drc, config).await {
+                Some(l) => {
+                    info!("Using YouTube DRC audio ({l:.1} LUFS)");
+                    (path, lufs) = (drc, l);
+                }
+                None => info!("Using YouTube DRC audio"),
+            }
+            if lufs >= QUIET_LUFS {
+                return (path, None);
+            }
+        }
+    }
+    let gain = (TARGET_LUFS - lufs).clamp(0.0, 30.0);
+    info!("Boosting audio by {gain:.1} dB");
+    (path, Some(gain))
+}
+
+async fn download_drc(
+    url: &str,
+    title: &str,
+    dir: &Path,
+    config: &Config,
+    deadline: Deadline,
+) -> Option<PathBuf> {
+    let drc_dir = dir.join("drc");
+    std::fs::create_dir_all(&drc_dir).ok()?;
+    let out = drc_dir.join("audio.%(ext)s").to_string_lossy().to_string();
+    let format = drc_audio_format(upload_budget(config) / (1024 * 1024));
+    info!("Downloading YouTube DRC audio");
+    if let Err(e) = run_ytdlp(
+        &["-f", &format, "-o", &out, "--no-warnings", "--no-progress"],
+        url,
+        config,
+        deadline,
+    )
+    .await
+    {
+        info!("No usable DRC audio: {}", tail(&e.to_string(), 200));
+        return None;
+    }
+    let file = find_prefixed_file(&drc_dir, "audio.")?;
+    if title.is_empty() {
+        return Some(file);
+    }
+    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("m4a").to_string();
+    let named = titled_path(&drc_dir, title, "audio", &ext);
+    std::fs::rename(&file, &named).ok().map(|_| named).or(Some(file))
+}
+
+/// Send finished audio: as-is when it fits, re-encoded smaller when it does not,
+/// and split into numbered parts when even that is not enough. `boost_db`, set
+/// only for quiet audio, forces an encode with that gain.
 async fn deliver_audio(
     bot: &Bot,
     target: &Target,
     path: &Path,
     title: &str,
     dir: &Path,
+    boost_db: Option<f64>,
     config: &Config,
 ) -> Result<(), BoxError> {
     let budget = upload_budget(config);
     let duration = media_duration(&config.ffprobe_bin, path).await.unwrap_or(0.0);
-    let filter = loudness_filter(path, config).await;
+    let filter = boost_db.map(boost_filter).unwrap_or_else(|| "anull".to_string());
 
-    // Encoding above the source bitrate only adds size and time. 64k is the
-    // floor because the source may be HE-AAC, which plain AAC needs more bits
-    // to match.
-    let source_kbps = if duration > 0.0 {
-        (file_size(path) as f64 * 8.0 / duration / 1000.0).ceil() as u64
-    } else {
-        128
+    // Boosting means encoding anyway; never above the source bitrate (64k floor,
+    // since the source may be HE-AAC), and skip it when it clearly cannot fit.
+    let boost = boost_db.map(|_| {
+        let source_kbps = if duration > 0.0 {
+            (file_size(path) as f64 * 8.0 / duration / 1000.0).ceil() as u64
+        } else {
+            128
+        };
+        source_kbps.clamp(64, 128)
+    });
+    let fits = match boost {
+        Some(kbps) => duration <= 0.0 || (duration * kbps as f64 * 1000.0 / 8.0 * 1.03) as u64 <= budget,
+        None => true,
     };
-    let kbps = source_kbps.clamp(64, 128);
-    // Plus ~3% container overhead. Skip this encode when it clearly cannot
-    // fit; with an unknown duration, try it anyway.
-    let estimate = (duration * kbps as f64 * 1000.0 / 8.0 * 1.03) as u64;
 
-    if duration <= 0.0 || estimate <= budget {
-        // sendAudio only plays MP3/M4A; normalize_audio also takes care of that.
+    if fits {
+        // sendAudio only plays MP3/M4A; anything else would land as a bare file.
         let converted_dir = dir.join("converted");
         std::fs::create_dir_all(&converted_dir)?;
-        let normalized = normalize_audio(path, &converted_dir, title, kbps, &filter, config).await;
-        let size = file_size(&normalized);
+        let converted =
+            normalize_audio(path, &converted_dir, title, boost.map(|k| (filter.as_str(), k)), config).await;
+        let size = file_size(&converted);
         if size <= budget {
-            return send_audio_file(bot, target, &normalized, title, config).await;
+            return send_audio_file(bot, target, &converted, title, config).await;
         }
         warn!(
             "Audio is {}MB, over the {}MB upload limit",
             human_mb(size),
-            human_mb(config.max_upload_bytes)
-        );
-    } else {
-        info!(
-            "Audio at {kbps}k would be ~{}MB, over the {}MB upload limit",
-            human_mb(estimate),
             human_mb(config.max_upload_bytes)
         );
     }
@@ -977,8 +1082,7 @@ async fn deliver_audio(
             "-i".as_ref(), path.as_ref(),
             "-vn".as_ref(),
             "-af".as_ref(), filter.as_ref(),
-            "-ar".as_ref(), AUDIO_SAMPLE_RATE.as_ref(),
-            "-c:a".as_ref(), "aac".as_ref(),
+            "-c:a".as_ref(), aac_encoder(config).as_ref(),
             "-b:a".as_ref(), "32k".as_ref(),
             "-ac".as_ref(), "1".as_ref(),
             "-movflags".as_ref(), "+faststart".as_ref(),
