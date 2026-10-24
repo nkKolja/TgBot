@@ -282,6 +282,16 @@ fn titled_path(dir: &Path, title: &str, fallback: &str, ext: &str) -> PathBuf {
     dir.join(format!("{stem}.{ext}"))
 }
 
+/// Loudness normalisation for every audio file the bot sends. Some sources are
+/// mastered far below streaming level (YouTube serves such uploads untouched and
+/// only boosts them in its own player), so the raw track plays very quietly on a
+/// phone. -16 LUFS is the usual target for speech and mobile listening.
+const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
+
+/// loudnorm upsamples to 192 kHz internally and outputs that rate unless told
+/// otherwise, so every normalised encode pins it back to 48 kHz.
+const AUDIO_SAMPLE_RATE: &str = "48000";
+
 /// Re-encode audio at whatever bitrate fits the upload budget. Returns `None`
 /// when even the floor bitrate would not fit, in which case the caller splits.
 async fn shrink_audio(
@@ -312,6 +322,8 @@ async fn shrink_audio(
         &[
             "-i".as_ref(), src.as_ref(),
             "-vn".as_ref(),
+            "-af".as_ref(), LOUDNORM.as_ref(),
+            "-ar".as_ref(), AUDIO_SAMPLE_RATE.as_ref(),
             "-c:a".as_ref(), "aac".as_ref(),
             "-b:a".as_ref(), bitrate.as_ref(),
             "-ac".as_ref(), channels.as_ref(),
@@ -328,25 +340,18 @@ async fn shrink_audio(
     Ok(Some(dest))
 }
 
-/// Remux to M4A when the container is something Telegram will not play as
-/// audio (opus/webm, for instance). Returns the original path if it is already
-/// fine or if the remux fails.
+/// Encode to 128k M4A with loudness normalisation. This also turns containers
+/// Telegram will not play as audio (opus/webm, for instance) into M4A. Returns
+/// the original path if the encode fails, so the user still gets something.
 async fn normalize_audio(src: &Path, dir: &Path, title: &str, config: &Config) -> PathBuf {
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if matches!(ext.as_str(), "mp3" | "m4a" | "mp4" | "aac") {
-        return src.to_path_buf();
-    }
-
     let dest = titled_path(dir, title, "audio", "m4a");
-    info!("Converting .{ext} audio to m4a for Telegram");
+    info!("Normalising loudness and encoding audio to m4a");
     match run_ffmpeg(
         &[
             "-i".as_ref(), src.as_ref(),
             "-vn".as_ref(),
+            "-af".as_ref(), LOUDNORM.as_ref(),
+            "-ar".as_ref(), AUDIO_SAMPLE_RATE.as_ref(),
             "-c:a".as_ref(), "aac".as_ref(),
             "-b:a".as_ref(), "128k".as_ref(),
             "-movflags".as_ref(), "+faststart".as_ref(),
@@ -855,8 +860,10 @@ async fn audio_via_ytdlp(
     Ok(())
 }
 
-/// Send finished audio: as-is when it fits, re-encoded smaller when it does not,
-/// and split into numbered parts when even that is not enough.
+/// Send finished audio, always loudness-normalised: at 128k when that fits,
+/// re-encoded smaller when it does not, and split into numbered parts when even
+/// that is not enough. Every encode starts from the downloaded original, so the
+/// audio is never transcoded twice.
 async fn deliver_audio(
     bot: &Bot,
     target: &Target,
@@ -865,23 +872,33 @@ async fn deliver_audio(
     dir: &Path,
     config: &Config,
 ) -> Result<(), BoxError> {
-    // sendAudio only plays MP3/M4A; anything else would land as a bare file.
-    let converted_dir = dir.join("converted");
-    std::fs::create_dir_all(&converted_dir)?;
-    let path = &normalize_audio(path, &converted_dir, title, config).await;
-
     let budget = upload_budget(config);
-    let size = file_size(path);
-    if size <= budget {
-        return send_audio_file(bot, target, path, title, config).await;
-    }
-
-    warn!(
-        "Audio is {}MB, over the {}MB upload limit",
-        human_mb(size),
-        human_mb(config.max_upload_bytes)
-    );
     let duration = media_duration(&config.ffprobe_bin, path).await.unwrap_or(0.0);
+    // 128 kbit/s plus ~3% container overhead. Skip the 128k encode when it
+    // clearly cannot fit; with an unknown duration, try it anyway.
+    let est_128k = (duration * 128_000.0 / 8.0 * 1.03) as u64;
+
+    if duration <= 0.0 || est_128k <= budget {
+        // sendAudio only plays MP3/M4A; normalize_audio also takes care of that.
+        let converted_dir = dir.join("converted");
+        std::fs::create_dir_all(&converted_dir)?;
+        let normalized = normalize_audio(path, &converted_dir, title, config).await;
+        let size = file_size(&normalized);
+        if size <= budget {
+            return send_audio_file(bot, target, &normalized, title, config).await;
+        }
+        warn!(
+            "Audio is {}MB, over the {}MB upload limit",
+            human_mb(size),
+            human_mb(config.max_upload_bytes)
+        );
+    } else {
+        info!(
+            "Audio at 128k would be ~{}MB, over the {}MB upload limit",
+            human_mb(est_128k),
+            human_mb(config.max_upload_bytes)
+        );
+    }
 
     let shrunk_dir = dir.join("shrunk");
     std::fs::create_dir_all(&shrunk_dir)?;
@@ -895,6 +912,8 @@ async fn deliver_audio(
         &[
             "-i".as_ref(), path.as_ref(),
             "-vn".as_ref(),
+            "-af".as_ref(), LOUDNORM.as_ref(),
+            "-ar".as_ref(), AUDIO_SAMPLE_RATE.as_ref(),
             "-c:a".as_ref(), "aac".as_ref(),
             "-b:a".as_ref(), "32k".as_ref(),
             "-ac".as_ref(), "1".as_ref(),
