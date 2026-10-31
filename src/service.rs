@@ -174,6 +174,22 @@ fn owns(manager: &Path, args: &[&str], name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether uv installed `name` with its "default" extras. `uv tool list
+/// --show-extras` prints "NAME vX.Y [extras: default]"; a uv too old for the
+/// flag gets the benefit of the doubt.
+fn uv_has_default_extras(uv: &Path, name: &str) -> bool {
+    let Ok(out) = Command::new(uv).args(["tool", "list", "--show-extras"]).output() else {
+        return true;
+    };
+    if !out.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(name))
+        .is_none_or(|line| line.contains("default"))
+}
+
 fn run_step(program: &Path, args: &[&str], label: &str) {
     println!("  {} {}", program.file_name().unwrap_or_default().to_string_lossy(), args.join(" "));
     match Command::new(program).args(args).status() {
@@ -185,10 +201,13 @@ fn run_step(program: &Path, args: &[&str], label: &str) {
 
 /// Update yt-dlp or gallery-dl through whatever installed it.
 fn update_downloader(name: &str, brew: Option<&Path>, old_macos: bool, uv: Option<&Path>) {
+    // yt-dlp's "default" extras bring the solver it runs (with Deno) for
+    // YouTube's JavaScript challenges; a plain install has none.
+    let spec = if name == "yt-dlp" { "\"yt-dlp[default]\"" } else { name };
     if let Some(brew) = brew.filter(|b| owns(b, &["list", "--versions", name], name)) {
         if old_macos {
             println!("  {name} comes from Homebrew, which cannot update it on this macOS.");
-            println!("  Switch it to uv: brew uninstall {name} && uv tool install --python 3.13 {name}");
+            println!("  Switch it to uv: brew uninstall {name} && uv tool install --python 3.13 {spec}");
         } else {
             run_step(brew, &["upgrade", name], name);
         }
@@ -196,6 +215,10 @@ fn update_downloader(name: &str, brew: Option<&Path>, old_macos: bool, uv: Optio
     }
     if let Some(uv) = uv.filter(|uv| owns(uv, &["tool", "list"], name)) {
         run_step(uv, &["tool", "upgrade", name], name);
+        if name == "yt-dlp" && !uv_has_default_extras(uv, name) {
+            println!("  yt-dlp was installed without its default extras, so YouTube's challenges");
+            println!("  go unsolved. Once: uv tool install --python 3.13 {spec}");
+        }
         return;
     }
     let bin = crate::config::which(name);
@@ -209,6 +232,48 @@ fn update_downloader(name: &str, brew: Option<&Path>, old_macos: bool, uv: Optio
     } else {
         println!("  {name} was not installed by Homebrew or uv; update it the way it was installed");
         println!("  (for example: pip install -U {name})");
+    }
+}
+
+/// yt-dlp needs a JavaScript runtime for YouTube, Deno by default. Without one
+/// it warns and some formats are missing.
+fn update_deno(brew: Option<&Path>, old_macos: bool) {
+    if let Some(brew) = brew.filter(|b| owns(b, &["list", "--versions", "deno"], "deno")) {
+        if old_macos {
+            println!("  deno comes from Homebrew, which cannot update it on this macOS.");
+            println!("  Switch to the official installer: brew uninstall deno && curl -fsSL https://deno.land/install.sh | sh");
+        } else {
+            run_step(brew, &["upgrade", "deno"], "deno");
+        }
+        return;
+    }
+    let deno = crate::config::which("deno");
+    if deno.is_file() {
+        upgrade_deno(&deno);
+    } else {
+        println!("  YouTube needs Deno: brew install deno");
+        println!("  (on macOS 12: curl -fsSL https://deno.land/install.sh | sh)");
+    }
+}
+
+/// `deno upgrade` (the official installer's copy updates itself), undone when
+/// the new binary does not start. Deno's Intel builds already need macOS 12,
+/// so on a Mac that cannot go further the release that raises that must not
+/// replace the copy that works.
+fn upgrade_deno(deno: &Path) {
+    let previous = deno.with_file_name("deno.previous");
+    if let Err(e) = fs::copy(deno, &previous) {
+        eprintln!("  deno: could not keep a copy of it ({e}), not upgrading");
+        return;
+    }
+    run_step(deno, &["upgrade"], "deno");
+    if quiet(Command::new(deno).arg("--version")) {
+        let _ = fs::remove_file(&previous);
+        return;
+    }
+    eprintln!("  deno: the new version does not run here, putting the old one back");
+    if let Err(e) = fs::rename(&previous, deno) {
+        eprintln!("  deno: could not put it back ({e}); the old copy is {}", previous.display());
     }
 }
 
@@ -230,6 +295,7 @@ fn update_tools() {
         println!("  Photo posts need gallery-dl: brew install gallery-dl");
         println!("  (on macOS 12 or older: uv tool install --python 3.13 gallery-dl)");
     }
+    update_deno(brew.as_deref(), old_macos);
 
     // ffmpeg/ffprobe come from Homebrew when they come from a package manager at all.
     match &brew {
@@ -311,6 +377,7 @@ mod tests {
 
     #[test]
     fn ownership_is_read_from_the_package_manager_listing() {
+        let _exec = crate::exec_lock();
         let dir = tempfile::TempDir::new().unwrap();
         let fake = dir.path().join("fake-uv");
         // What `uv tool list` prints.
@@ -326,5 +393,60 @@ mod tests {
         assert!(!owns(&fake, &["tool", "list"], "ffmpeg"));
         assert!(!owns(&fake, &["tool", "list"], "gallery"));
         assert!(!owns(&dir.path().join("missing"), &["tool", "list"], "yt-dlp"));
+    }
+
+    #[test]
+    fn a_yt_dlp_without_its_default_extras_is_noticed() {
+        let _exec = crate::exec_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let uv = |listing: &str| {
+            let fake = dir.path().join("fake-uv");
+            fs::write(&fake, format!("#!/bin/sh\nprintf '{listing}'\n")).unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+            fake
+        };
+        // What `uv tool list --show-extras` prints.
+        let plain = uv("gallery-dl v1.32.19\\n- gallery-dl\\nyt-dlp v2026.10.26\\n- yt-dlp\\n");
+        assert!(!uv_has_default_extras(&plain, "yt-dlp"));
+        let full = uv("yt-dlp v2026.10.26 [extras: default]\\n- yt-dlp\\n");
+        assert!(uv_has_default_extras(&full, "yt-dlp"));
+    }
+
+    /// A stand-in for deno whose `upgrade` replaces it with a script that
+    /// exits with `new_exit`, as a build for a newer macOS would fail to start.
+    fn fake_deno(dir: &Path, new_exit: u8) -> PathBuf {
+        let deno = dir.join("deno");
+        fs::write(
+            &deno,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = upgrade ]; then\n  printf '#!/bin/sh\\nexit {new_exit}\\n' > \"$0.new\"\n  chmod +x \"$0.new\"\n  mv \"$0.new\" \"$0\"\nfi\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&deno, fs::Permissions::from_mode(0o755)).unwrap();
+        deno
+    }
+
+    #[test]
+    fn a_deno_upgrade_that_does_not_start_is_undone() {
+        let _exec = crate::exec_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let deno = fake_deno(dir.path(), 1);
+        let before = fs::read(&deno).unwrap();
+        upgrade_deno(&deno);
+        assert_eq!(fs::read(&deno).unwrap(), before);
+        assert!(!dir.path().join("deno.previous").exists());
+    }
+
+    #[test]
+    fn a_deno_upgrade_that_starts_is_kept() {
+        let _exec = crate::exec_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let deno = fake_deno(dir.path(), 0);
+        let before = fs::read(&deno).unwrap();
+        upgrade_deno(&deno);
+        assert_ne!(fs::read(&deno).unwrap(), before);
+        assert!(quiet(Command::new(&deno).arg("--version")));
+        assert!(!dir.path().join("deno.previous").exists());
     }
 }

@@ -161,29 +161,44 @@ pub fn extract_supported_url(text: &str) -> Option<String> {
     text.split_whitespace().find_map(supported_url)
 }
 
+/// Width and height as the video is shown. A phone stores a portrait video
+/// as landscape frames plus a 90° rotation flag, and Telegram sizes its player
+/// from the numbers it is given, so those are swapped back.
+fn displayed_dimensions(probe: &str) -> Option<(Option<u32>, Option<u32>)> {
+    let (mut width, mut height, mut rotation) = (None, None, 0.0_f64);
+    for line in probe.lines() {
+        match line.split_once('=') {
+            Some(("width", v)) => width = v.trim().parse().ok(),
+            Some(("height", v)) => height = v.trim().parse().ok(),
+            // ffmpeg 5+ reports a display matrix; older versions a rotate tag.
+            Some(("rotation" | "TAG:rotate", v)) => rotation = v.trim().parse().unwrap_or(0.0),
+            _ => {}
+        }
+    }
+    if width.is_none() && height.is_none() {
+        return None;
+    }
+    if (rotation.round() as i64).rem_euclid(180) == 90 {
+        std::mem::swap(&mut width, &mut height);
+    }
+    Some((width, height))
+}
+
 pub async fn video_dimensions(ffprobe: &Path, path: &Path) -> (Option<u32>, Option<u32>) {
     // Try ffprobe first, fall back to ffmpeg -i if ffprobe is not available
+    // "V": the video itself, not cover art stored as a picture stream.
     let out = AsyncCommand::new(ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=p=0",
-        ])
+        .args(["-v", "error", "-select_streams", "V:0", "-show_entries"])
+        .arg("stream=width,height:stream_side_data=rotation:stream_tags=rotate")
+        .args(["-of", "default=nw=1"])
         .arg(path)
         .output()
         .await;
 
     match out {
         Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            let parts: Vec<&str> = s.trim().split(',').collect();
-            if parts.len() == 2 {
-                return (parts[0].parse().ok(), parts[1].parse().ok());
+            if let Some(dimensions) = displayed_dimensions(&String::from_utf8_lossy(&o.stdout)) {
+                return dimensions;
             }
         }
         Ok(o) => {
@@ -209,7 +224,7 @@ pub async fn video_dimensions(ffprobe: &Path, path: &Path) -> (Option<u32>, Opti
             if !line.contains("Video:") {
                 continue;
             }
-            for token in line.split(|c: char| c == ',' || c == ' ' || c == '[') {
+            for token in line.split([',', ' ', '[']) {
                 let token = token.trim();
                 if let Some((w_str, h_str)) = token.split_once('x') {
                     if let (Ok(w), Ok(h)) = (w_str.parse::<u32>(), h_str.parse::<u32>()) {
@@ -230,13 +245,12 @@ pub fn find_prefixed_file(dir: &Path, prefix: &str) -> Option<PathBuf> {
         .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
+        .find(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .map(|n| n.starts_with(prefix))
                 .unwrap_or(false)
         })
-        .next()
 }
 
 pub fn ytdlp_auth_args(url: &str, config: &Config) -> Vec<String> {
@@ -327,7 +341,9 @@ pub fn is_auth_failure(output: &str) -> bool {
 pub fn user_facing_error(err: &str) -> String {
     const MAX_CHARS: usize = 300;
     let lower = err.to_lowercase();
-    let detail = if lower.contains("cancelled") && lower.contains("limit") {
+    let detail = if lower.contains("encode exceeded") {
+        "Обрада је трајала предуго.".to_string()
+    } else if lower.contains("cancelled") && lower.contains("limit") {
         "Преузимање је трајало предуго.".to_string()
     } else if let Some(line) = err.lines().rev().find(|l| l.contains("ERROR:")) {
         line.split_once("ERROR:").map(|(_, r)| r.trim().to_string()).unwrap_or_default()
@@ -363,9 +379,27 @@ pub async fn media_duration(ffprobe: &Path, path: &Path) -> Option<f64> {
     String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok()
 }
 
+/// Passed to every yt-dlp run. A YouTube link copied from a playlist or a Mix
+/// (`watch?v=…&list=…`) otherwise downloads the whole list, and a live stream
+/// would be recorded until the timeout, by an ffmpeg that outlives yt-dlp.
+pub const YTDLP_ONE_VIDEO: &[&str] = &[
+    "--no-playlist",
+    "--playlist-items", "1",
+    "--match-filter", "!is_live",
+];
+
+/// What yt-dlp prints when `!is_live` turns a link down.
+pub fn is_live_skip(output: &str) -> bool {
+    output.contains("does not pass filter (!is_live)")
+}
+
 /// Get video duration in seconds using yt-dlp extract_info (no download).
 pub async fn get_video_duration(url: &str, config: &Config) -> Option<f64> {
     let mut cmd = AsyncCommand::new(&config.ytdlp_bin);
+    if let Some(path) = crate::config::tool_path() {
+        cmd.env("PATH", path);
+    }
+    cmd.args(YTDLP_ONE_VIDEO);
     cmd.args(["--print", "duration", "--no-download", "--no-warnings", "--quiet"]);
     for arg in ytdlp_auth_args(url, config) {
         cmd.arg(arg);
@@ -473,6 +507,24 @@ mod tests {
             "Грешка: Преузимање је трајало предуго."
         );
         assert!(user_facing_error(&"x".repeat(5000)).chars().count() < 320);
+    }
+
+    #[test]
+    fn rotated_phone_videos_report_their_displayed_size() {
+        let shown = |probe: &str| displayed_dimensions(probe);
+        assert_eq!(shown("width=1920\nheight=1080\nrotation=-90\n"), Some((Some(1080), Some(1920))));
+        assert_eq!(shown("width=1920\nheight=1080\nTAG:rotate=270\n"), Some((Some(1080), Some(1920))));
+        assert_eq!(shown("width=1920\nheight=1080\nrotation=180\n"), Some((Some(1920), Some(1080))));
+        assert_eq!(shown("width=640\nheight=360\n"), Some((Some(640), Some(360))));
+        assert_eq!(shown(""), None);
+    }
+
+    #[test]
+    fn slow_encodes_are_not_blamed_on_the_download() {
+        assert_eq!(
+            user_facing_error("re-encode failed: ffmpeg cancelled: encode exceeded 600s limit"),
+            "Грешка: Обрада је трајала предуго."
+        );
     }
 
     #[test]

@@ -22,8 +22,9 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::download::{
-    cookie_retry_browser, file_size, fit_video, run_ffmpeg, run_tool, send_document_file,
-    send_video_file, telegram_friendly_video, upload_budget, with_retry, BoxError, Deadline,
+    cookie_retry_browser, file_size, fit_video, named_for_sending, refused, run_ffmpeg, run_tool,
+    send_document_file, send_or_document, send_video_file, telegram_friendly_video,
+    upload_budget, with_retry, BoxError, Deadline,
 };
 use crate::helpers::{
     is_gallery_auth_failure, is_instagram_post, media_duration, video_dimensions, ytdlp_auth_args,
@@ -69,6 +70,7 @@ pub async fn send_gallery(
     std::fs::create_dir_all(&download_dir)?;
 
     let mut files = download(url, &download_dir, config, deadline).await?;
+    // --range already stops gallery-dl at this many; this is a safety net.
     if files.len() > MAX_ITEMS {
         warn!("{url} has {} files, sending the first {MAX_ITEMS}", files.len());
         files.truncate(MAX_ITEMS);
@@ -105,6 +107,7 @@ async fn download(
     deadline: Deadline,
 ) -> Result<Vec<PathBuf>, BoxError> {
     let dir_arg = dir.to_string_lossy().into_owned();
+    let range = format!("1-{MAX_ITEMS}");
     let args = [
         "-D", dir_arg.as_str(),
         // One line per downloaded file on stdout, in order.
@@ -112,6 +115,9 @@ async fn download(
         // Instagram's ready-made MP4 (H.264 + AAC) instead of DASH streams,
         // which gallery-dl would pass to the yt-dlp Python module to merge.
         "-o", "extractor.instagram.videos=merged",
+        // Stop once there is as much as will be sent, rather than fetching a
+        // long thread or gallery in full only to throw most of it away.
+        "--range", range.as_str(),
     ];
     // gallery-dl takes the same --cookies / --cookies-from-browser flags.
     let auth = ytdlp_auth_args(url, config);
@@ -221,7 +227,10 @@ async fn prepare(file: &Path, work: &Path, config: &Config) -> Result<Item, BoxE
         "gif" => Item::Animation(file.to_path_buf()),
         "mp4" | "m4v" | "mov" | "webm" | "mkv" => {
             let ready = telegram_friendly_video(file, work, config).await?;
-            let path = fit_video(&ready, work, config).await?;
+            let fitted = fit_video(&ready, work, config).await?;
+            // Sent under the name it was posted with.
+            let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let path = named_for_sending(&fitted, work, &stem);
             let (width, height) = video_dimensions(&config.ffprobe_bin, &path).await;
             let duration = media_duration(&config.ffprobe_bin, &path).await;
             Item::Video { path, width, height, duration }
@@ -392,12 +401,15 @@ async fn deliver(bot: &Bot, target: &Target, items: &[Item], config: &Config) ->
                 let album: Vec<&Item> = indices.iter().map(|&i| &items[i]).collect();
                 match send_album(bot, target, &album).await {
                     Ok(()) => sent += album.len(),
-                    Err(e) => {
-                        warn!("Album of {} failed ({e}), sending the items one by one", album.len());
+                    Err(e) if refused(&e) => {
+                        warn!("Album of {} refused ({e}), sending the items one by one", album.len());
                         for item in album {
                             note(send_single(bot, target, item, config).await, &mut sent);
                         }
                     }
+                    // The album may have arrived anyway; sending its items
+                    // again could post them twice.
+                    Err(e) => note(Err(e.into()), &mut sent),
                 }
             }
             Batch::Single(i) => note(send_single(bot, target, &items[*i], config).await, &mut sent),
@@ -461,11 +473,7 @@ async fn send_photo_file(bot: &Bot, target: &Target, path: &Path) -> Result<(), 
     }
     // Telegram can still refuse a photo it fails to process (an unusual JPEG,
     // say); as a file it gets through.
-    if let Err(e) = with_retry(|| req.send_ref()).await {
-        warn!("send_photo failed ({e}), retrying as document");
-        send_document_file(bot, target, path, None).await?;
-    }
-    Ok(())
+    send_or_document(bot, target, path, None, req).await
 }
 
 async fn send_animation_file(bot: &Bot, target: &Target, path: &Path) -> Result<(), BoxError> {
@@ -473,11 +481,7 @@ async fn send_animation_file(bot: &Bot, target: &Target, path: &Path) -> Result<
     if let Some(id) = target.reply_to {
         req = req.reply_parameters(ReplyParameters::new(id));
     }
-    if let Err(e) = with_retry(|| req.send_ref()).await {
-        warn!("send_animation failed ({e}), retrying as document");
-        send_document_file(bot, target, path, None).await?;
-    }
-    Ok(())
+    send_or_document(bot, target, path, None, req).await
 }
 
 #[cfg(test)]

@@ -174,6 +174,27 @@ impl Config {
     }
 }
 
+/// PATH for yt-dlp and gallery-dl, when it needs extending. yt-dlp needs Deno
+/// for YouTube and looks for it on PATH, but the Deno installer puts it in
+/// ~/.deno/bin, which a launchd service's PATH does not include.
+pub(crate) fn tool_path() -> Option<&'static std::ffi::OsStr> {
+    static PATH: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let deno_dir = dirs::home_dir()?.join(".deno/bin");
+        if !deno_dir.is_dir() {
+            return None;
+        }
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs: Vec<PathBuf> = std::env::split_paths(&current).collect();
+        if dirs.contains(&deno_dir) {
+            return None;
+        }
+        dirs.push(deno_dir);
+        std::env::join_paths(dirs).ok()
+    })
+    .as_deref()
+}
+
 pub(crate) fn which(name: &str) -> PathBuf {
     // Try the system `which` first (works when PATH is correct).
     if let Some(p) = std::process::Command::new("which")
@@ -200,6 +221,7 @@ pub(crate) fn which(name: &str) -> PathBuf {
         "/usr/local/bin",
         "/usr/bin",
         &format!("{home}/.local/bin"),
+        &format!("{home}/.deno/bin"),
     ];
     for dir in candidates {
         let p = PathBuf::from(dir).join(name);

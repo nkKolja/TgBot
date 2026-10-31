@@ -17,12 +17,18 @@ pub type UserModes = Arc<DashMap<UserId, Mode>>;
 /// A long video waiting for the user to pick audio or video.
 pub struct Pending {
     pub url: String,
+    /// Who sent the link: only they can answer for it. `None` when it was
+    /// sent anonymously (an admin posting as the group, a channel), and then
+    /// anyone can.
+    pub user: Option<UserId>,
+    /// Where the download goes once they do (in groups, a reply to the link).
+    pub target: Target,
     pub created: Instant,
 }
 
-/// Keyed by chat *and* user, so a second long link in another chat does not
-/// overwrite the first, and only the person who sent a link can answer for it.
-pub type PendingDownloads = Arc<DashMap<(ChatId, UserId), Pending>>;
+/// Keyed by the chat and the question's message, so every question keeps its
+/// own link, however many are open at once.
+pub type PendingDownloads = Arc<DashMap<(ChatId, MessageId), Pending>>;
 
 /// How long the audio/video buttons stay valid.
 pub const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
