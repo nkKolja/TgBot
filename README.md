@@ -1,12 +1,12 @@
 # TgBot (Rust)
 
-Telegram bot that downloads videos, audio and photos from links and sends them back in the chat.
+Telegram bot that downloads videos, audio and photos from links and sends them back in the chat, and turns video files sent to it (WebM and the like) into videos Telegram plays.
 
-Supported platforms: YouTube, Facebook, Instagram, TikTok, Twitter/X, Reddit, LinkedIn, and 1800+ more via yt-dlp can be enabled.
+Supported platforms: YouTube, Facebook, Instagram, TikTok, Twitter/X, Reddit, LinkedIn, Twitch clips, Vimeo, SoundCloud and Pinterest. Mirror links people paste for nicer previews (fxtwitter, vxtwitter, fixupx, ddinstagram, vxtiktok, rxddit) work too. yt-dlp supports 1800+ more sites, which can be enabled in `SUPPORTED_DOMAINS` (`src/helpers.rs`).
 
 ## Requirements
 
-- **Rust** (1.80+) — [install](https://rustup.rs/)
+- **Rust** (1.86+) — [install](https://rustup.rs/)
 - **yt-dlp** — `brew install yt-dlp`
 - **gallery-dl** — `brew install gallery-dl` (photo posts and carousels; optional, but without it photo posts fail).
   On **macOS 12 or older** Homebrew has no ready-made packages and tries to compile
@@ -17,6 +17,16 @@ Supported platforms: YouTube, Facebook, Instagram, TikTok, Twitter/X, Reddit, Li
   ```
   The bot finds it in `~/.local/bin` on its own, and `service update` keeps it current.
 - **ffmpeg** (includes ffprobe) — `brew install ffmpeg`
+- **Deno** — `brew install deno`. Recent yt-dlp needs a JavaScript runtime for
+  YouTube; without one it warns *"No supported JavaScript runtime could be
+  found"* and some formats are missing. On **macOS 12** use the official
+  installer instead, which needs no compiling:
+  `curl -fsSL https://deno.land/install.sh | sh`. The bot finds it in
+  `~/.deno/bin` on its own, and `service update` keeps it current. Deno's
+  Intel builds need macOS 12 or newer, so `service update` keeps the old copy
+  if a new release no longer starts. Deno runs yt-dlp's challenge solver,
+  which comes with yt-dlp's default extras: a yt-dlp installed with uv needs
+  `uv tool install --python 3.13 "yt-dlp[default]"`.
 - **Telegram bot token** — get one from [@BotFather](https://t.me/BotFather)
 
 ## Setup
@@ -104,8 +114,12 @@ around it. The bot instead makes the file fit:
 - Anything Telegram refuses to treat as playable media falls back to being sent
   as a plain document.
 
-To lift the cap properly, run your own
-[Bot API server](https://github.com/tdlib/telegram-bot-api) (2000 MB) and set:
+Telegram also caps what a bot may **download** at **20 MB**, which limits the
+video files people send the bot to convert.
+
+To lift both caps properly, run your own
+[Bot API server](https://github.com/tdlib/telegram-bot-api) in `--local` mode
+(2000 MB) and set:
 
 ```
 TELEGRAM_API_URL=http://localhost:8081
@@ -115,11 +129,34 @@ MAX_UPLOAD_MB=2000
 ### Re-encoding and older hardware
 
 Video is downloaded as H.264 whenever the site offers it, so most links go out
-with no re-encode at all. Only VP9/AV1 video or Opus audio is converted, and
-each stream is handled separately: a file with H.264 video and Opus audio gets
-its audio converted while the video is copied. x264 runs with the `veryfast`
-preset and one encode at a time, which keeps an older Xeon Mac Pro inside the
-timeouts. See `X264_PRESET`, `MAX_CONCURRENT_ENCODES` and `ENCODE_TIMEOUT_SECS`.
+with no re-encode at all. Only VP9/AV1 video, H.264 that phones cannot decode
+(10-bit or 4:4:4), or Opus audio is converted, and each stream is handled
+separately: a file with H.264 video and Opus audio gets its audio converted
+while the video is copied. x264 runs with the `veryfast` preset and one encode
+at a time, which keeps an older Xeon Mac Pro inside the timeouts. See
+`X264_PRESET`, `MAX_CONCURRENT_ENCODES` and `ENCODE_TIMEOUT_SECS`.
+
+### Converting video files sent to the bot
+
+Send the bot a video file — a WebM above all, but also MKV, AVI, MOV, or an
+MP4 sent as a file — and it comes back as an MP4 that Telegram plays inline,
+named like the original (`clip.webm` comes back as `clip.mp4`). There is no
+command for it: sending the file is the request.
+
+- In a **private chat** every video is looked at. One that already plays gets a
+  short note instead of a copy of itself.
+- In **groups** only files Telegram shows as a bare attachment (WebM, MKV, AVI,
+  MOV, …) are converted; ordinary videos people post are never downloaded.
+- In `/audio` mode the sound comes back instead. A WebM with nothing but sound
+  comes back as audio in any mode.
+- A supported link in the same message wins over the attached file.
+- At most 20 MB (see [File size limits](#file-size-limits)).
+- Stickers, GIFs and round video messages are left alone.
+
+Files come from anyone, so before ffmpeg touches one it is checked to be a real
+video container (`-format_whitelist`), and it is never saved under the sender's
+own file extension: a playlist dressed up as a video cannot make ffmpeg read
+other files on the machine into the video it sends back.
 
 ### Photos and carousels
 
@@ -130,7 +167,9 @@ yt-dlp only downloads video, so photo posts go through
   since a post can be photos, a video, or a carousel mixing both. Reels stay
   with yt-dlp.
 - **Any other link** where yt-dlp reports that there is no video (an image
-  tweet, say) is retried as a photo post. This also applies in `/audio` mode.
+  tweet, say) or does not know the link at all (Reddit picture posts, i.redd.it
+  images, TikTok slideshows) is retried as a photo post. This also applies in
+  `/audio` mode.
 
 Cookies work as for yt-dlp: anonymous first, then one retry with browser
 cookies. Instagram does not show posts to logged-out visitors, so in practice
@@ -149,7 +188,7 @@ What gets sent, within Telegram's limits:
   ordinary video links.
 - Telegram's flood control ("Too Many Requests") is waited out rather than
   treated as an error, and items are paced about a second apart.
-- At most 20 items are sent per link.
+- At most 20 items are sent per link, and gallery-dl stops downloading there.
 
 ### Auto-dubbed audio
 
@@ -213,13 +252,14 @@ logged in as the user the bot will run as.
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-brew install yt-dlp gallery-dl ffmpeg firefox
+brew install yt-dlp gallery-dl ffmpeg deno firefox
 ```
 
 On macOS 12 or older (a 2013 Mac Pro, say), Homebrew compiles everything from
 source, which can take hours and often fails. Install gallery-dl with uv as
 shown under [Requirements](#requirements); yt-dlp can go the same way
-(`uv tool install --python 3.13 yt-dlp`).
+(`uv tool install --python 3.13 "yt-dlp[default]"`), and Deno with its own installer
+(`curl -fsSL https://deno.land/install.sh | sh`; Deno needs macOS 12 at least).
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -317,14 +357,18 @@ easier to shrug off when it is not your real one.
 - `/start` — start the bot
 - `/video` — switch to video mode (default)
 - `/audio` — switch to audio mode
+- `/video <link>`, `/audio <link>` — fetch that one link that way, without changing the mode. Also works sent as a reply to a message with a link (someone's video in a group, say, to get its sound)
 - Send a link — bot downloads and sends back the video or audio
+- Send a video file — it comes back as a video Telegram plays (see [Converting video files](#converting-video-files-sent-to-the-bot))
 - Instagram posts and other photo posts come back as photos (albums for carousels)
-- For long videos the bot asks whether to download as audio or continue as video
+- SoundCloud links always come back as audio
+- For long videos the bot asks whether to download as audio or continue as video. Each question remembers its own link, and in groups it replies to that link.
 - The link can sit anywhere in the message ("look at this https://youtu.be/…"), or behind a text link
+- Only links to one video or post count. Profile, channel, playlist, subreddit and board links are ignored (a profile link in a group would otherwise be answered with a whole feed), as are Twitch channel links, which are live streams. A YouTube link copied from a playlist or a Mix (`watch?v=…&list=…`) fetches just that video, and a stream that is live right now gets a message instead of a recording.
 - Downloads are capped at `DOWNLOAD_TIMEOUT_SECS` (60s by default) in total, to avoid wasting time on files that exceed Telegram's size limit
 - The audio/video buttons expire after 10 minutes and only work for the person who sent the link
 
-In groups, the bot only responds to supported links and stays silent on errors. Make sure **Group Privacy** is turned off in BotFather (`Bot Settings → Group Privacy → Turn off`).
+In groups, the bot only responds to supported links (and video files Telegram cannot play) and stays silent on errors. Make sure **Group Privacy** is turned off in BotFather (`Bot Settings → Group Privacy → Turn off`).
 
 ## Configuration
 
@@ -340,7 +384,7 @@ In groups, the bot only responds to supported links and stays silent on errors. 
 | `X264_PRESET` | `veryfast` | x264 preset for re-encodes. `veryfast` suits older Intel Macs; `fast` or `medium` give smaller files on faster CPUs. |
 | `MAX_CONCURRENT_ENCODES` | `1` | How many ffmpeg jobs may run at once. x264 already uses every core, so raising this rarely helps. |
 | `MAX_UPLOAD_MB` | `50` | Largest upload the Bot API accepts. Raise only with a self-hosted Bot API server. |
-| `TELEGRAM_API_URL` | *(unset)* | Self-hosted Bot API server URL. |
+| `TELEGRAM_API_URL` | *(unset)* | Self-hosted Bot API server URL. Also lifts the 20 MB cap on files sent to the bot for conversion. |
 | `*_COOKIES`, `COOKIES_FILE`, `COOKIES_FROM_BROWSER`, `COOKIES_AUTO` | see above | Cookie handling for login-gated posts. |
 | `LONG_VIDEO_SECS` | `300` | Videos longer than this (in seconds) trigger an audio/video choice prompt |
-| `RUST_LOG` | `tgbot=info` | Log level filter |
+| `RUST_LOG` | `tgbot=info` | Log filter, e.g. `tgbot=debug`. Replaces the default entirely. |

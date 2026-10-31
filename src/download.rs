@@ -3,17 +3,18 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use teloxide::prelude::*;
-use teloxide::types::{InputFile, ReplyParameters};
+use teloxide::types::{ChatAction, InputFile, ReplyParameters};
 use teloxide::RequestError;
 use tempfile::TempDir;
 use tokio::process::Command as AsyncCommand;
 use tracing::{info, warn};
 
-use crate::config::Config;
-use crate::gallery::{send_gallery, GalleryFailure};
+use crate::config::{tool_path, Config};
+use crate::gallery::{fetch as fetch_gallery, send_files, send_gallery, GalleryFailure};
 use crate::helpers::{
-    detect_browser, find_prefixed_file, is_auth_failure, is_instagram_post, is_no_video,
-    media_duration, video_dimensions, ytdlp_auth_args,
+    detect_browser, find_prefixed_file, is_auth_failure, is_instagram_post, is_live_skip,
+    is_no_video, media_duration, thread_link, video_dimensions, ytdlp_auth_args,
+    YTDLP_ONE_VIDEO,
 };
 use crate::types::Target;
 
@@ -92,26 +93,68 @@ pub(crate) fn is_timeout(e: &BoxError) -> bool {
     e.to_string().contains("cancelled")
 }
 
-/// Codec name of the first stream of the given kind (`v:0`, `a:0`).
-pub(crate) async fn stream_codec(ffprobe: &Path, path: &Path, selector: &str) -> Option<String> {
+/// One field (`codec_name`, `pix_fmt`) of the first stream of the given kind
+/// (`v:0`, `a:0`).
+async fn stream_field(ffprobe: &Path, path: &Path, selector: &str, field: &str) -> Option<String> {
+    // Not CSV: for a stream with side data (a phone video's rotation) that
+    // prints "h264," and the codec no longer compares equal.
     let out = AsyncCommand::new(ffprobe)
         .args(["-v", "error", "-select_streams", selector])
-        .args(["-show_entries", "stream=codec_name", "-of", "csv=p=0"])
+        .args(["-show_entries", &format!("stream={field}"), "-of", "default=nw=1:nk=1"])
         .arg(path)
         .output()
         .await
         .ok()?;
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
-    (out.status.success() && !name.is_empty()).then_some(name)
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value = stdout.lines().next().unwrap_or("").trim().to_ascii_lowercase();
+    (out.status.success() && !value.is_empty()).then_some(value)
 }
+
+/// Codec name of the first stream of the given kind (`v:0`, `a:0`).
+pub(crate) async fn stream_codec(ffprobe: &Path, path: &Path, selector: &str) -> Option<String> {
+    stream_field(ffprobe, path, selector, "codec_name").await
+}
+
+/// Codec and pixel format of the video, in one probe. "V" passes over cover
+/// art, which some files carry as a still-picture video stream.
+async fn video_format(ffprobe: &Path, path: &Path) -> (Option<String>, Option<String>) {
+    let Ok(out) = AsyncCommand::new(ffprobe)
+        .args(["-v", "error", "-select_streams", "V:0"])
+        .args(["-show_entries", "stream=codec_name,pix_fmt", "-of", "default=nw=1"])
+        .arg(path)
+        .output()
+        .await
+    else {
+        return (None, None);
+    };
+    let (mut codec, mut pix_fmt) = (None, None);
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        match line.split_once('=') {
+            Some(("codec_name", v)) => codec = Some(v.trim().to_ascii_lowercase()),
+            Some(("pix_fmt", v)) => pix_fmt = Some(v.trim().to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    let known = |v: Option<String>| v.filter(|v| !v.is_empty() && v != "unknown");
+    (known(codec), known(pix_fmt))
+}
+
+/// Demuxers ffmpeg may use on a video it converts: real containers only, none
+/// of the playlist formats (HLS, concat) that open further files. Passed as
+/// `-format_whitelist`, it keeps a crafted upload from making ffmpeg read
+/// files off this machine into a video that then gets sent back.
+pub(crate) const VIDEO_DEMUXERS: &str = "mov,matroska,avi,flv,mpegts,mpeg,asf,ogg,rm,ivf,gif";
 
 /// Make a video Telegram will play inline: H.264 + AAC/MP3 in MP4. Each part
 /// that is already right is copied, so most downloads cost a quick remux or
 /// nothing at all; only foreign codecs (VP9, AV1, Opus) are re-encoded.
 pub(crate) async fn telegram_friendly_video(path: &Path, dir: &Path, config: &Config) -> Result<PathBuf, BoxError> {
-    let vcodec = stream_codec(&config.ffprobe_bin, path, "v:0").await;
+    let (vcodec, pix_fmt) = video_format(&config.ffprobe_bin, path).await;
     let acodec = stream_codec(&config.ffprobe_bin, path, "a:0").await;
-    let video_ok = vcodec.as_deref() == Some("h264");
+    // Phones only decode 8-bit 4:2:0 H.264 in hardware; High 10 or 4:4:4
+    // (screen recorders, some anime encodes) shows up as a black or broken video.
+    let video_ok = vcodec.as_deref() == Some("h264")
+        && matches!(pix_fmt.as_deref(), Some("yuv420p") | Some("yuvj420p"));
     let audio_ok = matches!(acodec.as_deref(), None | Some("aac") | Some("mp3"));
     let is_mp4 = matches!(
         path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
@@ -135,8 +178,9 @@ pub(crate) async fn telegram_friendly_video(path: &Path, dir: &Path, config: &Co
     );
     let dest = dir.join("telegram.mp4");
     let mut args: Vec<std::ffi::OsString> = vec![
+        "-format_whitelist".into(), VIDEO_DEMUXERS.into(),
         "-i".into(), path.into(),
-        "-map".into(), "0:v:0".into(),
+        "-map".into(), "0:V:0".into(),
         "-map".into(), "0:a:0?".into(),
     ];
     if video_ok {
@@ -147,8 +191,9 @@ pub(crate) async fn telegram_friendly_video(path: &Path, dir: &Path, config: &Co
             "-preset".into(), config.x264_preset.as_str().into(),
             "-crf".into(), "24".into(),
             "-pix_fmt".into(), "yuv420p".into(),
-            // Never upscale; cap the width at 1280.
-            "-vf".into(), "scale=w='min(1280,iw)':h=-2".into(),
+            // Never upscale; cap the width at 1280. x264 needs even sides,
+            // and odd ones (853x480) are common in WebMs.
+            "-vf".into(), "scale=w='trunc(min(1280,iw)/2)*2':h=-2".into(),
         ]);
     }
     if audio_ok {
@@ -167,6 +212,28 @@ pub(crate) async fn telegram_friendly_video(path: &Path, dir: &Path, config: &Co
 }
 
 // --- Sending -----------------------------------------------------------------
+
+/// Keeps "sending video…" showing in the chat while the bot works, which can
+/// take a minute. Telegram clears an action after five seconds, so it is sent
+/// again until the guard is dropped.
+pub(crate) struct ChatActionGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ChatActionGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+pub(crate) fn show_chat_action(bot: &Bot, chat: ChatId, action: ChatAction) -> ChatActionGuard {
+    let bot = bot.clone();
+    ChatActionGuard(tokio::spawn(async move {
+        loop {
+            // Purely cosmetic: a failure here is not worth reporting.
+            let _ = bot.send_chat_action(chat, action).await;
+            tokio::time::sleep(Duration::from_secs(4)).await;
+        }
+    }))
+}
 
 /// Run a Telegram request, waiting out "429 Too Many Requests" instead of
 /// failing. Telegram allows roughly one message a second per chat and 20 a
@@ -189,6 +256,37 @@ where
             }
             result => return result,
         }
+    }
+}
+
+/// Whether Telegram looked at the upload and turned it down (wrong type, a
+/// codec it cannot play), so that sending the file another way may work. A
+/// network error is not that: the upload may well have arrived, and sending it
+/// again as a document would post it twice.
+pub(crate) fn refused(e: &RequestError) -> bool {
+    matches!(e, RequestError::Api(_))
+}
+
+/// Send media with `req`. If Telegram refuses it as that kind of media (an
+/// odd codec or container), send the same file as a plain document, which
+/// still gets it there.
+pub(crate) async fn send_or_document<R>(
+    bot: &Bot,
+    target: &Target,
+    path: &Path,
+    caption: Option<&str>,
+    req: R,
+) -> Result<(), BoxError>
+where
+    R: Request<Err = RequestError>,
+{
+    match with_retry(|| req.send_ref()).await {
+        Ok(_) => Ok(()),
+        Err(e) if refused(&e) => {
+            warn!("Telegram refused {} ({e}), sending it as a document", path.display());
+            send_document_file(bot, target, path, caption).await
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -229,14 +327,11 @@ pub(crate) async fn send_video_file(
     if let Some(h) = h {
         req = req.height(h);
     }
-
-    // Telegram rejects anything it cannot treat as a playable video (odd codec,
-    // odd container). Falling back to a plain document still gets the file there.
-    if let Err(e) = with_retry(|| req.send_ref()).await {
-        warn!("send_video failed ({e}), retrying as document");
-        send_document_file(bot, target, path, None).await?;
+    // Like the size, passed rather than left to Telegram's own probing.
+    if let Some(secs) = media_duration(&config.ffprobe_bin, path).await.filter(|s| *s > 0.0) {
+        req = req.duration(secs.round() as u32);
     }
-    Ok(())
+    send_or_document(bot, target, path, None, req).await
 }
 
 async fn send_audio_file(
@@ -256,30 +351,47 @@ async fn send_audio_file(
     if let Some(id) = target.reply_to {
         req = req.reply_parameters(ReplyParameters::new(id));
     }
-
-    // sendAudio only accepts MP3/M4A; anything else (or an oversized upload)
-    // errors out, and a document keeps the file usable either way.
-    if let Err(e) = with_retry(|| req.send_ref()).await {
-        warn!("send_audio failed ({e}), retrying as document");
-        send_document_file(bot, target, path, Some(title)).await?;
-    }
-    Ok(())
+    // sendAudio only accepts MP3/M4A.
+    send_or_document(bot, target, path, Some(title), req).await
 }
 
 // --- Shrinking ---------------------------------------------------------------
 
 /// Build an output path in `dir` named after the title, so desktop Telegram
 /// shows something meaningful instead of `shrunk.m4a`.
-fn titled_path(dir: &Path, title: &str, fallback: &str, ext: &str) -> PathBuf {
+pub(crate) fn titled_path(dir: &Path, title: &str, fallback: &str, ext: &str) -> PathBuf {
     let safe: String = title
         .chars()
         .map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c })
         .collect();
     let stem = if safe.trim().is_empty() { fallback } else { safe.trim() };
-    // Filesystems cap names at 255 bytes; Cyrillic titles hit that sooner than
-    // the character count suggests.
-    let stem: String = stem.chars().take(120).collect();
+    // Filesystems cap names at 255 bytes, and Cyrillic takes two bytes a
+    // character, emoji (all over TikTok titles) four.
+    let mut bytes = 0;
+    let stem: String = stem
+        .chars()
+        .take_while(|c| {
+            bytes += c.len_utf8();
+            bytes <= 200
+        })
+        .collect();
     dir.join(format!("{stem}.{ext}"))
+}
+
+/// Move a finished video to a file named after its title, or after the file
+/// it was made from: that name is what people see when they save it, rather
+/// than `telegram.mp4`. Keeps the old name if the move fails.
+pub(crate) fn named_for_sending(path: &Path, dir: &Path, title: &str) -> PathBuf {
+    let out_dir = dir.join("out");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+    let dest = titled_path(&out_dir, title, "video", ext);
+    match std::fs::create_dir_all(&out_dir).and_then(|()| std::fs::rename(path, &dest)) {
+        Ok(()) => dest,
+        Err(e) => {
+            warn!("Could not rename {} for sending: {e}", path.display());
+            path.to_path_buf()
+        }
+    }
 }
 
 /// Audio quieter than this gets the loudness fallback. Normal streaming audio
@@ -428,7 +540,11 @@ async fn normalize_audio(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if boost.is_none() && matches!(ext.as_str(), "mp3" | "m4a" | "mp4" | "aac") {
+    // Sites with no audio-only format (TikTok, clip sites) leave yt-dlp's
+    // audio selector to fall back on the whole video, which sendAudio would
+    // get as is. "V" skips cover art, which audio files may carry.
+    let has_video = stream_codec(&config.ffprobe_bin, src, "V:0").await.is_some();
+    if boost.is_none() && !has_video && matches!(ext.as_str(), "mp3" | "m4a" | "mp4" | "aac") {
         return src.to_path_buf();
     }
     let (filter, kbps) = boost.unwrap_or(("anull", 128));
@@ -552,6 +668,9 @@ pub(crate) async fn run_tool(
     let timeout = deadline.left()?;
     let mut cmd = AsyncCommand::new(bin);
     cmd.args(args).args(extra).arg(url).kill_on_drop(true);
+    if let Some(path) = tool_path() {
+        cmd.env("PATH", path);
+    }
     // Without explicit pipes the child inherits our stdio and wait_with_output()
     // hands back empty buffers — which silently blinds every check we make on
     // the tool's output.
@@ -560,15 +679,45 @@ pub(crate) async fn run_tool(
     let child = cmd
         .spawn()
         .map_err(|e| format!("{name} could not be started ({}): {e}", bin.display()))?;
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(out)) => Ok(ToolOutput {
-            success: out.status.success(),
-            status: out.status,
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        }),
-        Ok(Err(e)) => Err(format!("{name} io error: {e}").into()),
-        Err(_) => Err(deadline.expired(name)),
+    let pid = child.id();
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    tokio::select! {
+        result = &mut output => match result {
+            Ok(out) => Ok(ToolOutput {
+                success: out.status.success(),
+                status: out.status,
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }),
+            Err(e) => Err(format!("{name} io error: {e}").into()),
+        },
+        () = tokio::time::sleep(timeout) => {
+            // kill_on_drop only reaches the tool itself, once `output` is
+            // dropped. What the tool started (yt-dlp hands merges and live
+            // streams to ffmpeg) would run on, so it goes first, while it can
+            // still be found as the tool's child.
+            if let Some(pid) = pid {
+                kill_children(pid).await;
+            }
+            Err(deadline.expired(name))
+        }
+    }
+}
+
+/// Kill the processes `pid` started. They can only be told apart while `pid`
+/// is alive: after that they are adopted by launchd (or init).
+async fn kill_children(pid: u32) {
+    let Ok(out) = AsyncCommand::new("pgrep").args(["-P", &pid.to_string()]).output().await else {
+        return;
+    };
+    for child in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+        if let Ok(child) = child.parse::<i32>() {
+            // SAFETY: kill(2) takes plain integers and touches no memory.
+            unsafe {
+                libc::kill(child, libc::SIGKILL);
+            }
+        }
     }
 }
 
@@ -630,11 +779,24 @@ async fn spawn_ytdlp(
     config: &Config,
     deadline: Deadline,
 ) -> Result<String, BoxError> {
-    let out = run_tool("yt-dlp", &config.ytdlp_bin, args, extra, url, deadline).await?;
+    let args: Vec<&str> = YTDLP_ONE_VIDEO.iter().chain(args).copied().collect();
+    let out = run_tool("yt-dlp", &config.ytdlp_bin, &args, extra, url, deadline).await?;
     if !out.success {
         return Err(format!("yt-dlp failed ({}): {}", out.status, out.failure_detail()).into());
     }
+    if is_live_skip(&out.stdout) {
+        return Err(LIVE_STREAM.into());
+    }
     Ok(format!("{}\n{}", out.stderr, out.stdout))
+}
+
+/// Shown for a link to a stream that is live right now.
+const LIVE_STREAM: &str = "Ово је пренос уживо, то не могу да преузмем.";
+
+/// A failure that a second, differently configured download cannot fix.
+fn is_final(e: &BoxError) -> bool {
+    let text = e.to_string();
+    is_timeout(e) || is_no_video(&text) || text == LIVE_STREAM
 }
 
 /// Audio track selector. `language_preference>=10` is how yt-dlp marks YouTube's
@@ -649,15 +811,37 @@ const AUDIO_FORMAT: &str = concat!(
     "ba/best"
 );
 
+/// The title, as a JSON string: one line per print however many lines the
+/// title has (TikTok and Instagram captions run to several).
+const TITLE_TEMPLATE: &str = "%(title)j";
+
+/// The title printed with TITLE_TEMPLATE. A second download attempt prints
+/// it again, so the last line counts. Line breaks become spaces.
+fn read_title(file: &Path) -> String {
+    let printed = std::fs::read_to_string(file).unwrap_or_default();
+    let Some(line) = printed.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return String::new();
+    };
+    let title = serde_json::from_str::<String>(line.trim()).unwrap_or_else(|_| line.to_string());
+    title.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub async fn download_and_send_video(
     bot: &Bot,
-    msg: &Message,
+    target: Target,
     url: &str,
     config: &Config,
 ) -> Result<(), BoxError> {
-    let target = Target::of(msg);
+    let _status = show_chat_action(bot, target.chat, ChatAction::UploadVideo);
     // DOWNLOAD_TIMEOUT_SECS covers every download attempt for the link together.
     let deadline = Deadline::start(config.download_timeout);
+
+    // yt-dlp does not know thread links at all; gallery-dl is the only way in.
+    if thread_link(url).is_some() {
+        return send_gallery(bot, &target, url, config, deadline)
+            .await
+            .map_err(thread_error);
+    }
 
     // An Instagram post can be photos, a video, or a carousel of both. yt-dlp
     // only sees the videos; gallery-dl fetches everything.
@@ -686,6 +870,45 @@ pub async fn download_and_send_video(
         },
         result => result,
     }
+}
+
+/// A failed thread download, in words. Threads are deleted within days, so a
+/// 404 is the usual way for one to fail.
+fn thread_error(failure: GalleryFailure) -> BoxError {
+    match failure {
+        GalleryFailure::Unavailable => "За тај линк на серверу треба инсталирати gallery-dl.".into(),
+        GalleryFailure::Failed(e) if e.to_string().contains("404 Not Found") => "Тога више нема.".into(),
+        GalleryFailure::Failed(e) => e,
+    }
+}
+
+/// The sound of a thread post's video, or the post itself when nothing in it
+/// has sound (a picture, a silent WebM).
+async fn audio_from_thread(
+    bot: &Bot,
+    target: &Target,
+    url: &str,
+    config: &Config,
+    deadline: Deadline,
+) -> Result<(), BoxError> {
+    let tmp = TempDir::new()?;
+    let files = fetch_gallery(url, tmp.path(), config, deadline)
+        .await
+        .map_err(thread_error)?;
+    for file in &files {
+        if stream_codec(&config.ffprobe_bin, file, "a:0").await.is_some() {
+            // gallery-dl names the file after the one that was posted.
+            let title = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let boost = quiet_boost(file, config).await;
+            deliver_audio(bot, target, file, &title, tmp.path(), boost, config).await?;
+            info!("Sent audio: {url}");
+            return Ok(());
+        }
+    }
+    send_files(bot, target, &files, tmp.path(), config).await
 }
 
 /// For a link yt-dlp found no video in: fetch it as a photo post instead.
@@ -735,6 +958,10 @@ async fn video_via_ytdlp(
     );
     let max_filesize = format!("{budget_mb}M");
 
+    // The title names the file that gets sent.
+    let title_file = tmp.path().join("title.txt");
+    let title_file_str = title_file.to_string_lossy().to_string();
+
     // --- Preferred download ---
     info!("Attempting preferred video download: {url}");
     let preferred_out = tmp.path().join("video.%(ext)s");
@@ -745,6 +972,7 @@ async fn video_via_ytdlp(
             "-f", &preferred_format,
             "--max-filesize", &max_filesize,
             "-o", &preferred_out_str,
+            "--print-to-file", TITLE_TEMPLATE, &title_file_str,
             "--merge-output-format", "mp4",
             "--no-progress",
         ],
@@ -781,7 +1009,7 @@ async fn video_via_ytdlp(
             if let Err(e) = preferred_result {
                 // A timed-out first attempt leaves no time for a second, bigger
                 // one, and a post with no video has nothing for it to find.
-                if is_timeout(&e) || is_no_video(&e.to_string()) {
+                if is_final(&e) {
                     return Err(e);
                 }
             }
@@ -795,6 +1023,7 @@ async fn video_via_ytdlp(
                     "--ffmpeg-location", &ffmpeg_dir,
                     "-f", "bv+ba[language_preference>=10]/bv+ba/b",
                     "-o", &fallback_out_str,
+                    "--print-to-file", TITLE_TEMPLATE, &title_file_str,
                     "--remux-video", "mp4",
                     "--no-warnings", "--no-progress",
                 ],
@@ -809,7 +1038,9 @@ async fn video_via_ytdlp(
 
     let ready = telegram_friendly_video(&video_path, tmp.path(), config).await?;
     let fitted = fit_video(&ready, tmp.path(), config).await?;
-    send_video_file(bot, target, &fitted, config).await?;
+    let title = read_title(&title_file);
+    let named = named_for_sending(&fitted, tmp.path(), &title);
+    send_video_file(bot, target, &named, config).await?;
     info!("Sent video: {url}");
     Ok(())
 }
@@ -837,14 +1068,15 @@ pub(crate) async fn fit_video(path: &Path, dir: &Path, config: &Config) -> Resul
         let shrunk = dir.join("fitted.mp4");
         let vb = format!("{video_kbps}k");
         // Cap the height too: a very low bitrate at 1080p looks worse than 480p.
-        // Never upscale: a 360p source stays 360p.
+        // Never upscale: a 360p source stays 360p. Even sides for x264.
         let scale = if video_kbps < 500 {
-            "scale=w=-2:h='min(480,ih)'"
+            "scale=w=-2:h='trunc(min(480,ih)/2)*2'"
         } else {
-            "scale=w=-2:h='min(720,ih)'"
+            "scale=w=-2:h='trunc(min(720,ih)/2)*2'"
         };
         let r = run_ffmpeg(
             &[
+                "-format_whitelist".as_ref(), VIDEO_DEMUXERS.as_ref(),
                 "-i".as_ref(), path.as_ref(),
                 "-c:v".as_ref(), "libx264".as_ref(),
                 "-preset".as_ref(), config.x264_preset.as_ref(),
@@ -881,12 +1113,15 @@ pub(crate) async fn fit_video(path: &Path, dir: &Path, config: &Config) -> Resul
 
 pub async fn download_and_send_audio(
     bot: &Bot,
-    msg: &Message,
+    target: Target,
     url: &str,
     config: &Config,
 ) -> Result<(), BoxError> {
-    let target = Target::of(msg);
+    let _status = show_chat_action(bot, target.chat, ChatAction::UploadVoice);
     let deadline = Deadline::start(config.download_timeout);
+    if thread_link(url).is_some() {
+        return audio_from_thread(bot, &target, url, config, deadline).await;
+    }
     match audio_via_ytdlp(bot, &target, url, config, deadline).await {
         // A photo post has no sound to extract; the photos are the next best thing.
         Err(e) if is_no_video(&e.to_string()) => {
@@ -914,7 +1149,7 @@ async fn audio_via_ytdlp(
         &[
             "-f", AUDIO_FORMAT,
             "-o", &audio_out_str,
-            "--print-to-file", "title", &title_file_str,
+            "--print-to-file", TITLE_TEMPLATE, &title_file_str,
             "--no-warnings", "--no-progress",
         ],
         url,
@@ -923,8 +1158,8 @@ async fn audio_via_ytdlp(
     )
     .await?;
 
-    let title = std::fs::read_to_string(&title_file).unwrap_or_default();
-    let title = title.trim();
+    let title = read_title(&title_file);
+    let title = title.as_str();
 
     let audio_path = find_prefixed_file(tmp.path(), "audio.")
         .ok_or("Audio file was not created")?;
@@ -984,9 +1219,25 @@ async fn quiet_fallback(
             }
         }
     }
+    (path, Some(gain_for(lufs)))
+}
+
+/// The gain that lifts audio measured at `lufs` to TARGET_LUFS.
+fn gain_for(lufs: f64) -> f64 {
     let gain = (TARGET_LUFS - lufs).clamp(0.0, 30.0);
     info!("Boosting audio by {gain:.1} dB");
-    (path, Some(gain))
+    gain
+}
+
+/// For audio that has no louder version to fall back on: the gain to apply
+/// when it is well below normal level, or `None`.
+pub(crate) async fn quiet_boost(path: &Path, config: &Config) -> Option<f64> {
+    let lufs = sample_loudness(path, config).await?;
+    if lufs >= QUIET_LUFS {
+        return None;
+    }
+    info!("Audio is quiet ({lufs:.1} LUFS)");
+    Some(gain_for(lufs))
 }
 
 async fn download_drc(
@@ -1024,7 +1275,7 @@ async fn download_drc(
 /// Send finished audio: as-is when it fits, re-encoded smaller when it does not,
 /// and split into numbered parts when even that is not enough. `boost_db`, set
 /// only for quiet audio, forces an encode with that gain.
-async fn deliver_audio(
+pub(crate) async fn deliver_audio(
     bot: &Bot,
     target: &Target,
     path: &Path,
@@ -1106,6 +1357,70 @@ async fn deliver_audio(
 }
 
 #[cfg(test)]
+mod titles {
+    use super::*;
+
+    #[test]
+    fn titles_keep_to_one_line_and_the_last_attempt() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("title.txt");
+        // Two attempts, each printing a multi-line TikTok caption as JSON.
+        std::fs::write(
+            &file,
+            "\"first try\"\n\"Funny cat\\n\\n#fyp \\u045b\\ud83d\\udc31\"\n",
+        )
+        .unwrap();
+        assert_eq!(read_title(&file), "Funny cat #fyp ћ🐱");
+        assert_eq!(read_title(&dir.path().join("missing.txt")), "");
+    }
+}
+
+#[cfg(test)]
+mod tool_runs {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Whether a process is gone: no longer listed, or a zombie waiting to be reaped.
+    fn is_dead(pid: &str) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .expect("ps must be available");
+        let stat = String::from_utf8_lossy(&out.stdout);
+        stat.trim().is_empty() || stat.trim_start().starts_with('Z')
+    }
+
+    #[test]
+    fn a_timeout_also_kills_what_the_tool_started() {
+        let _exec = crate::exec_lock();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(timeout_kills_children());
+    }
+
+    async fn timeout_kills_children() {
+        let dir = TempDir::new().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let tool = dir.path().join("tool.sh");
+        // Like yt-dlp handing a live stream to ffmpeg: a child that would
+        // outlive its parent.
+        std::fs::write(
+            &tool,
+            format!("#!/bin/sh\nsleep 60 &\necho $! > '{}'\nwait\n", pid_file.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = run_tool("tool", &tool, &[], &[], "url", Deadline::start(Duration::from_secs(3))).await;
+        let err = result.err().expect("the run must time out");
+        assert!(is_timeout(&err), "unexpected error: {err}");
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(is_dead(pid.trim()), "the tool's child is still running");
+    }
+}
+
+#[cfg(test)]
 mod live_check {
     use super::*;
 
@@ -1157,16 +1472,26 @@ mod conversion {
     }
 
     fn make(dir: &Path, name: &str, vcodec: &str, acodec: &str) -> PathBuf {
+        // The test pattern is RGB, from which libx264 would make 4:4:4 video
+        // that phones cannot play; real downloads are 4:2:0.
+        make_with(dir, name, "1920x1080", 2, &["-c:v", vcodec, "-pix_fmt", "yuv420p", "-c:a", acodec])
+    }
+
+    /// A test pattern with a tone, of the given size and length, encoded with `codecs`.
+    fn make_with(dir: &Path, name: &str, size: &str, secs: u32, codecs: &[&str]) -> PathBuf {
         let out = dir.join(name);
         let status = std::process::Command::new("ffmpeg")
             .args(["-y", "-loglevel", "error"])
-            .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=25:duration=2"])
-            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=2"])
-            .args(["-c:v", vcodec, "-c:a", acodec, "-shortest"])
+            .args(["-f", "lavfi", "-i"])
+            .arg(format!("testsrc=size={size}:rate=25:duration={secs}"))
+            .args(["-f", "lavfi", "-i"])
+            .arg(format!("sine=frequency=440:duration={secs}"))
+            .args(codecs)
+            .arg("-shortest")
             .arg(&out)
             .status()
             .expect("ffmpeg must be installed for this test");
-        assert!(status.success());
+        assert!(status.success(), "could not make {name}");
         out
     }
 
@@ -1205,8 +1530,104 @@ mod conversion {
         assert_eq!(helpers_dims(&cfg, &out).await, (Some(1280), Some(720)));
     }
 
+    #[tokio::test]
+    #[ignore = "needs ffmpeg"]
+    async fn odd_sized_webm_is_converted_with_even_sides() {
+        // x264 refuses odd sides; 853x480 is a common 480p WebM size.
+        let dir = TempDir::new().unwrap();
+        let src = make_with(dir.path(), "odd.webm", "853x480", 1, &["-c:v", "libvpx-vp9", "-c:a", "libopus"]);
+        let cfg = config();
+        let out = telegram_friendly_video(&src, dir.path(), &cfg).await.unwrap();
+        assert_eq!(stream_codec(&cfg.ffprobe_bin, &out, "v:0").await.as_deref(), Some("h264"));
+        assert_eq!(helpers_dims(&cfg, &out).await, (Some(852), Some(480)));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ffmpeg"]
+    async fn h264_that_phones_cannot_play_is_reencoded() {
+        let dir = TempDir::new().unwrap();
+        let src = make_with(
+            dir.path(), "full-chroma.mp4", "640x360", 1,
+            &["-c:v", "libx264", "-pix_fmt", "yuv444p", "-c:a", "aac"],
+        );
+        let cfg = config();
+        let out = telegram_friendly_video(&src, dir.path(), &cfg).await.unwrap();
+        assert_ne!(out, src);
+        assert_eq!(stream_field(&cfg.ffprobe_bin, &out, "v:0", "pix_fmt").await.as_deref(), Some("yuv420p"));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ffmpeg"]
+    async fn rotated_phone_video_reports_its_portrait_size() {
+        let dir = TempDir::new().unwrap();
+        let src = make_with(
+            dir.path(), "landscape.mp4", "640x360", 1,
+            &["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+        );
+        let rotated = dir.path().join("rotated.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-display_rotation:v:0", "90", "-i"])
+            .arg(&src)
+            .args(["-c", "copy"])
+            .arg(&rotated)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let cfg = config();
+        assert_eq!(helpers_dims(&cfg, &rotated).await, (Some(360), Some(640)));
+        // H.264 + AAC in MP4 is sent as it is, rotation flag and all.
+        assert_eq!(telegram_friendly_video(&rotated, dir.path(), &cfg).await.unwrap(), rotated);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ffmpeg"]
+    async fn shrinking_an_odd_height_video_works() {
+        let dir = TempDir::new().unwrap();
+        // VP9, since x264 cannot even make a 4:2:0 file this size.
+        let src = make_with(
+            dir.path(), "big.webm", "720x405", 4,
+            &["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-b:v", "4M", "-c:a", "libopus"],
+        );
+        let mut cfg = config();
+        // Room for half of it, so it has to be shrunk.
+        cfg.max_upload_bytes = 512 * 1024 + file_size(&src) / 2;
+        let result = fit_video(&src, dir.path(), &cfg).await;
+        let fitted = dir.path().join("fitted.mp4");
+        assert!(file_size(&fitted) > 0, "the shrink encode failed: {result:?}");
+        let (w, h) = helpers_dims(&cfg, &fitted).await;
+        assert_eq!(h, Some(404));
+        assert!(w.is_some_and(|w| w % 2 == 0), "odd width {w:?}");
+    }
+
     async fn helpers_dims(cfg: &Config, p: &Path) -> (Option<u32>, Option<u32>) {
         video_dimensions(&cfg.ffprobe_bin, p).await
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ffmpeg"]
+    async fn audio_mode_never_sends_a_video_file() {
+        // TikTok and clip sites have no audio-only format, so in audio mode
+        // yt-dlp's "ba/.../best" falls back to the whole video.
+        let dir = TempDir::new().unwrap();
+        let src = make_with(
+            dir.path(), "audio.mp4", "640x360", 1,
+            &["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+        );
+        let cfg = config();
+        let out = normalize_audio(&src, dir.path(), "song", None, &cfg).await;
+        assert_ne!(out, src);
+        assert_eq!(stream_codec(&cfg.ffprobe_bin, &out, "v:0").await, None);
+        assert_eq!(stream_codec(&cfg.ffprobe_bin, &out, "a:0").await.as_deref(), Some("aac"));
+
+        // Plain audio in an MP4 container still goes out as it is.
+        let plain = dir.path().join("plain.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=1", "-c:a", "aac"])
+            .arg(&plain)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(normalize_audio(&plain, dir.path(), "song", None, &cfg).await, plain);
     }
 }
 

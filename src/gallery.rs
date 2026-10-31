@@ -22,11 +22,13 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::download::{
-    cookie_retry_browser, file_size, fit_video, run_ffmpeg, run_tool, send_document_file,
-    send_video_file, telegram_friendly_video, upload_budget, with_retry, BoxError, Deadline,
+    cookie_retry_browser, file_size, fit_video, named_for_sending, refused, run_ffmpeg, run_tool,
+    send_document_file, send_or_document, send_video_file, telegram_friendly_video,
+    upload_budget, with_retry, BoxError, Deadline,
 };
 use crate::helpers::{
-    is_gallery_auth_failure, is_instagram_post, media_duration, video_dimensions, ytdlp_auth_args,
+    is_gallery_auth_failure, is_instagram_post, media_duration, thread_link, video_dimensions,
+    ytdlp_auth_args, ThreadLink,
 };
 use crate::types::Target;
 
@@ -61,25 +63,50 @@ pub async fn send_gallery(
     config: &Config,
     deadline: Deadline,
 ) -> Result<(), GalleryFailure> {
+    let tmp = TempDir::new()?;
+    let files = fetch(url, tmp.path(), config, deadline).await?;
+    send_files(bot, target, &files, tmp.path(), config).await?;
+    info!("Sent the post at {url}");
+    Ok(())
+}
+
+/// Download the post at `url` into a directory under `work`, returning its
+/// files in post order.
+pub async fn fetch(
+    url: &str,
+    work: &Path,
+    config: &Config,
+    deadline: Deadline,
+) -> Result<Vec<PathBuf>, GalleryFailure> {
     if !config.gallery_dl_bin.is_file() {
         return Err(GalleryFailure::Unavailable);
     }
-    let tmp = TempDir::new()?;
-    let download_dir = tmp.path().join("download");
+    let download_dir = work.join("download");
     std::fs::create_dir_all(&download_dir)?;
 
     let mut files = download(url, &download_dir, config, deadline).await?;
+    // --range already stops gallery-dl at this many; this is a safety net.
     if files.len() > MAX_ITEMS {
         warn!("{url} has {} files, sending the first {MAX_ITEMS}", files.len());
         files.truncate(MAX_ITEMS);
     }
     info!("gallery-dl fetched {} file(s) from {url}", files.len());
+    Ok(files)
+}
 
+/// Make fetched files fit for Telegram and send them, in albums where they can go.
+pub async fn send_files(
+    bot: &Bot,
+    target: &Target,
+    files: &[PathBuf],
+    work: &Path,
+    config: &Config,
+) -> Result<(), BoxError> {
     let mut items = Vec::with_capacity(files.len());
     for (i, file) in files.iter().enumerate() {
-        let work = tmp.path().join(format!("item{i}"));
-        std::fs::create_dir_all(&work)?;
-        match prepare(file, &work, config).await {
+        let item_dir = work.join(format!("item{i}"));
+        std::fs::create_dir_all(&item_dir)?;
+        match prepare(file, &item_dir, config).await {
             Ok(item) => items.push(item),
             Err(e) => warn!("Skipping {}: {e}", file.display()),
         }
@@ -89,7 +116,7 @@ pub async fn send_gallery(
     }
 
     deliver(bot, target, &items, config).await?;
-    info!("Sent {} item(s) from {url}", items.len());
+    info!("Sent {} item(s)", items.len());
     Ok(())
 }
 
@@ -105,6 +132,7 @@ async fn download(
     deadline: Deadline,
 ) -> Result<Vec<PathBuf>, BoxError> {
     let dir_arg = dir.to_string_lossy().into_owned();
+    let range = format!("1-{MAX_ITEMS}");
     let args = [
         "-D", dir_arg.as_str(),
         // One line per downloaded file on stdout, in order.
@@ -112,11 +140,16 @@ async fn download(
         // Instagram's ready-made MP4 (H.264 + AAC) instead of DASH streams,
         // which gallery-dl would pass to the yt-dlp Python module to merge.
         "-o", "extractor.instagram.videos=merged",
+        // Stop once there is as much as will be sent, rather than fetching a
+        // long thread or gallery in full only to throw most of it away.
+        "--range", range.as_str(),
     ];
+    let site = site_args(url);
     // gallery-dl takes the same --cookies / --cookies-from-browser flags.
     let auth = ytdlp_auth_args(url, config);
 
-    let first = attempt(&args, &auth, url, dir, config, deadline).await;
+    let first: Vec<String> = site.iter().chain(&auth).cloned().collect();
+    let first = attempt(&args, &first, url, dir, config, deadline).await;
     let Err(e) = first else { return first };
     // Instagram's post API answers nobody who is logged out, whatever error
     // text that produces, so any failure there counts as a login wall.
@@ -125,7 +158,8 @@ async fn download(
     let Some(browser) = cookie_retry_browser(&auth, config, wall, url) else {
         return Err(e);
     };
-    let mut retry = vec!["--cookies-from-browser".to_string(), browser.to_string()];
+    let mut retry = site;
+    retry.extend(["--cookies-from-browser".to_string(), browser.to_string()]);
     retry.extend(auth);
     attempt(&args, &retry, url, dir, config, deadline)
         .await
@@ -133,6 +167,23 @@ async fn download(
             warn!("Cookie retry via {browser} also failed: {retry_err}");
             if retry_err.to_string().contains("cancelled") { retry_err } else { e }
         })
+}
+
+/// gallery-dl options for particular links.
+fn site_args(url: &str) -> Vec<String> {
+    match thread_link(url) {
+        // A thread link stands for one post (the anchored one, or the
+        // opening post): fetch just its file, under the name it was posted
+        // with. Names can run to 255 bytes, too long for a path once the
+        // extension is added.
+        Some(ThreadLink::Post(no)) => vec![
+            "--filter".into(),
+            format!("no == {no}"),
+            "-f".into(),
+            "{filename[:60]}.{extension}".into(),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 async fn attempt(
@@ -221,7 +272,10 @@ async fn prepare(file: &Path, work: &Path, config: &Config) -> Result<Item, BoxE
         "gif" => Item::Animation(file.to_path_buf()),
         "mp4" | "m4v" | "mov" | "webm" | "mkv" => {
             let ready = telegram_friendly_video(file, work, config).await?;
-            let path = fit_video(&ready, work, config).await?;
+            let fitted = fit_video(&ready, work, config).await?;
+            // Sent under the name it was posted with.
+            let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let path = named_for_sending(&fitted, work, &stem);
             let (width, height) = video_dimensions(&config.ffprobe_bin, &path).await;
             let duration = media_duration(&config.ffprobe_bin, &path).await;
             Item::Video { path, width, height, duration }
@@ -392,12 +446,15 @@ async fn deliver(bot: &Bot, target: &Target, items: &[Item], config: &Config) ->
                 let album: Vec<&Item> = indices.iter().map(|&i| &items[i]).collect();
                 match send_album(bot, target, &album).await {
                     Ok(()) => sent += album.len(),
-                    Err(e) => {
-                        warn!("Album of {} failed ({e}), sending the items one by one", album.len());
+                    Err(e) if refused(&e) => {
+                        warn!("Album of {} refused ({e}), sending the items one by one", album.len());
                         for item in album {
                             note(send_single(bot, target, item, config).await, &mut sent);
                         }
                     }
+                    // The album may have arrived anyway; sending its items
+                    // again could post them twice.
+                    Err(e) => note(Err(e.into()), &mut sent),
                 }
             }
             Batch::Single(i) => note(send_single(bot, target, &items[*i], config).await, &mut sent),
@@ -461,11 +518,7 @@ async fn send_photo_file(bot: &Bot, target: &Target, path: &Path) -> Result<(), 
     }
     // Telegram can still refuse a photo it fails to process (an unusual JPEG,
     // say); as a file it gets through.
-    if let Err(e) = with_retry(|| req.send_ref()).await {
-        warn!("send_photo failed ({e}), retrying as document");
-        send_document_file(bot, target, path, None).await?;
-    }
-    Ok(())
+    send_or_document(bot, target, path, None, req).await
 }
 
 async fn send_animation_file(bot: &Bot, target: &Target, path: &Path) -> Result<(), BoxError> {
@@ -473,11 +526,7 @@ async fn send_animation_file(bot: &Bot, target: &Target, path: &Path) -> Result<
     if let Some(id) = target.reply_to {
         req = req.reply_parameters(ReplyParameters::new(id));
     }
-    if let Err(e) = with_retry(|| req.send_ref()).await {
-        warn!("send_animation failed ({e}), retrying as document");
-        send_document_file(bot, target, path, None).await?;
-    }
-    Ok(())
+    send_or_document(bot, target, path, None, req).await
 }
 
 #[cfg(test)]
