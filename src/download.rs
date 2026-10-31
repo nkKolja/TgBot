@@ -10,10 +10,11 @@ use tokio::process::Command as AsyncCommand;
 use tracing::{info, warn};
 
 use crate::config::{tool_path, Config};
-use crate::gallery::{send_gallery, GalleryFailure};
+use crate::gallery::{fetch as fetch_gallery, send_files, send_gallery, GalleryFailure};
 use crate::helpers::{
     detect_browser, find_prefixed_file, is_auth_failure, is_instagram_post, is_live_skip,
-    is_no_video, media_duration, video_dimensions, ytdlp_auth_args, YTDLP_ONE_VIDEO,
+    is_no_video, media_duration, thread_link, video_dimensions, ytdlp_auth_args,
+    YTDLP_ONE_VIDEO,
 };
 use crate::types::Target;
 
@@ -835,6 +836,13 @@ pub async fn download_and_send_video(
     // DOWNLOAD_TIMEOUT_SECS covers every download attempt for the link together.
     let deadline = Deadline::start(config.download_timeout);
 
+    // yt-dlp does not know thread links at all; gallery-dl is the only way in.
+    if thread_link(url).is_some() {
+        return send_gallery(bot, &target, url, config, deadline)
+            .await
+            .map_err(thread_error);
+    }
+
     // An Instagram post can be photos, a video, or a carousel of both. yt-dlp
     // only sees the videos; gallery-dl fetches everything.
     let mut gallery_error = None;
@@ -862,6 +870,45 @@ pub async fn download_and_send_video(
         },
         result => result,
     }
+}
+
+/// A failed thread download, in words. Threads are deleted within days, so a
+/// 404 is the usual way for one to fail.
+fn thread_error(failure: GalleryFailure) -> BoxError {
+    match failure {
+        GalleryFailure::Unavailable => "За тај линк на серверу треба инсталирати gallery-dl.".into(),
+        GalleryFailure::Failed(e) if e.to_string().contains("404 Not Found") => "Тога више нема.".into(),
+        GalleryFailure::Failed(e) => e,
+    }
+}
+
+/// The sound of a thread post's video, or the post itself when nothing in it
+/// has sound (a picture, a silent WebM).
+async fn audio_from_thread(
+    bot: &Bot,
+    target: &Target,
+    url: &str,
+    config: &Config,
+    deadline: Deadline,
+) -> Result<(), BoxError> {
+    let tmp = TempDir::new()?;
+    let files = fetch_gallery(url, tmp.path(), config, deadline)
+        .await
+        .map_err(thread_error)?;
+    for file in &files {
+        if stream_codec(&config.ffprobe_bin, file, "a:0").await.is_some() {
+            // gallery-dl names the file after the one that was posted.
+            let title = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let boost = quiet_boost(file, config).await;
+            deliver_audio(bot, target, file, &title, tmp.path(), boost, config).await?;
+            info!("Sent audio: {url}");
+            return Ok(());
+        }
+    }
+    send_files(bot, target, &files, tmp.path(), config).await
 }
 
 /// For a link yt-dlp found no video in: fetch it as a photo post instead.
@@ -1072,6 +1119,9 @@ pub async fn download_and_send_audio(
 ) -> Result<(), BoxError> {
     let _status = show_chat_action(bot, target.chat, ChatAction::UploadVoice);
     let deadline = Deadline::start(config.download_timeout);
+    if thread_link(url).is_some() {
+        return audio_from_thread(bot, &target, url, config, deadline).await;
+    }
     match audio_via_ytdlp(bot, &target, url, config, deadline).await {
         // A photo post has no sound to extract; the photos are the next best thing.
         Err(e) if is_no_video(&e.to_string()) => {
@@ -1177,6 +1227,17 @@ fn gain_for(lufs: f64) -> f64 {
     let gain = (TARGET_LUFS - lufs).clamp(0.0, 30.0);
     info!("Boosting audio by {gain:.1} dB");
     gain
+}
+
+/// For audio that has no louder version to fall back on: the gain to apply
+/// when it is well below normal level, or `None`.
+async fn quiet_boost(path: &Path, config: &Config) -> Option<f64> {
+    let lufs = sample_loudness(path, config).await?;
+    if lufs >= QUIET_LUFS {
+        return None;
+    }
+    info!("Audio is quiet ({lufs:.1} LUFS)");
+    Some(gain_for(lufs))
 }
 
 async fn download_drc(

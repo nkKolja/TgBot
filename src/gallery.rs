@@ -27,7 +27,8 @@ use crate::download::{
     upload_budget, with_retry, BoxError, Deadline,
 };
 use crate::helpers::{
-    is_gallery_auth_failure, is_instagram_post, media_duration, video_dimensions, ytdlp_auth_args,
+    is_gallery_auth_failure, is_instagram_post, media_duration, thread_link, video_dimensions,
+    ytdlp_auth_args, ThreadLink,
 };
 use crate::types::Target;
 
@@ -62,11 +63,25 @@ pub async fn send_gallery(
     config: &Config,
     deadline: Deadline,
 ) -> Result<(), GalleryFailure> {
+    let tmp = TempDir::new()?;
+    let files = fetch(url, tmp.path(), config, deadline).await?;
+    send_files(bot, target, &files, tmp.path(), config).await?;
+    info!("Sent the post at {url}");
+    Ok(())
+}
+
+/// Download the post at `url` into a directory under `work`, returning its
+/// files in post order.
+pub async fn fetch(
+    url: &str,
+    work: &Path,
+    config: &Config,
+    deadline: Deadline,
+) -> Result<Vec<PathBuf>, GalleryFailure> {
     if !config.gallery_dl_bin.is_file() {
         return Err(GalleryFailure::Unavailable);
     }
-    let tmp = TempDir::new()?;
-    let download_dir = tmp.path().join("download");
+    let download_dir = work.join("download");
     std::fs::create_dir_all(&download_dir)?;
 
     let mut files = download(url, &download_dir, config, deadline).await?;
@@ -76,12 +91,22 @@ pub async fn send_gallery(
         files.truncate(MAX_ITEMS);
     }
     info!("gallery-dl fetched {} file(s) from {url}", files.len());
+    Ok(files)
+}
 
+/// Make fetched files fit for Telegram and send them, in albums where they can go.
+pub async fn send_files(
+    bot: &Bot,
+    target: &Target,
+    files: &[PathBuf],
+    work: &Path,
+    config: &Config,
+) -> Result<(), BoxError> {
     let mut items = Vec::with_capacity(files.len());
     for (i, file) in files.iter().enumerate() {
-        let work = tmp.path().join(format!("item{i}"));
-        std::fs::create_dir_all(&work)?;
-        match prepare(file, &work, config).await {
+        let item_dir = work.join(format!("item{i}"));
+        std::fs::create_dir_all(&item_dir)?;
+        match prepare(file, &item_dir, config).await {
             Ok(item) => items.push(item),
             Err(e) => warn!("Skipping {}: {e}", file.display()),
         }
@@ -91,7 +116,7 @@ pub async fn send_gallery(
     }
 
     deliver(bot, target, &items, config).await?;
-    info!("Sent {} item(s) from {url}", items.len());
+    info!("Sent {} item(s)", items.len());
     Ok(())
 }
 
@@ -119,10 +144,12 @@ async fn download(
         // long thread or gallery in full only to throw most of it away.
         "--range", range.as_str(),
     ];
+    let site = site_args(url);
     // gallery-dl takes the same --cookies / --cookies-from-browser flags.
     let auth = ytdlp_auth_args(url, config);
 
-    let first = attempt(&args, &auth, url, dir, config, deadline).await;
+    let first: Vec<String> = site.iter().chain(&auth).cloned().collect();
+    let first = attempt(&args, &first, url, dir, config, deadline).await;
     let Err(e) = first else { return first };
     // Instagram's post API answers nobody who is logged out, whatever error
     // text that produces, so any failure there counts as a login wall.
@@ -131,7 +158,8 @@ async fn download(
     let Some(browser) = cookie_retry_browser(&auth, config, wall, url) else {
         return Err(e);
     };
-    let mut retry = vec!["--cookies-from-browser".to_string(), browser.to_string()];
+    let mut retry = site;
+    retry.extend(["--cookies-from-browser".to_string(), browser.to_string()]);
     retry.extend(auth);
     attempt(&args, &retry, url, dir, config, deadline)
         .await
@@ -139,6 +167,23 @@ async fn download(
             warn!("Cookie retry via {browser} also failed: {retry_err}");
             if retry_err.to_string().contains("cancelled") { retry_err } else { e }
         })
+}
+
+/// gallery-dl options for particular links.
+fn site_args(url: &str) -> Vec<String> {
+    match thread_link(url) {
+        // A thread link stands for one post (the anchored one, or the
+        // opening post): fetch just its file, under the name it was posted
+        // with. Names can run to 255 bytes, too long for a path once the
+        // extension is added.
+        Some(ThreadLink::Post(no)) => vec![
+            "--filter".into(),
+            format!("no == {no}"),
+            "-f".into(),
+            "{filename[:60]}.{extension}".into(),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 async fn attempt(

@@ -10,7 +10,7 @@ use tracing::{debug, error, info};
 use crate::config::Config;
 use crate::download::{download_and_send_audio, download_and_send_video};
 use crate::helpers::{
-    capitalize_first, extract_supported_url, get_video_duration, is_instagram_post,
+    capitalize_first, extract_supported_url, get_video_duration, is_audio_site, prefers_gallery,
     random_greeting, supported_url, user_facing_error,
 };
 use crate::types::{Cmd, Mode, Pending, PendingDownloads, Target, UserModes, PENDING_TTL};
@@ -121,7 +121,9 @@ pub async fn handle_message(
         debug!("Message without a supported link");
         if msg.chat.is_private() {
             let reply = if has_any_link(&msg) {
-                "Тај линк не умем да преузмем. Пошаљи линк до видеа или објаве.".to_string()
+                "Тај линк не умем да преузмем. Пошаљи линк до видеа или објаве, \
+                 не до профила или канала."
+                    .to_string()
             } else {
                 format!(
                     "{}, баци линк.\n/video за видео\n/audio за само звук",
@@ -149,12 +151,15 @@ async fn process_link(
     config: &Config,
 ) -> ResponseResult<()> {
     let target = Target::of(msg);
+    // SoundCloud and the like have nothing to send but sound.
+    let mode = if is_audio_site(&url) { Mode::Audio } else { mode };
     info!("Valid URL detected: mode={mode:?}, url={url}");
 
     // Long videos: offer audio instead before spending time on a big download.
-    // Instagram posts skip this: they are mostly photos, and asking yt-dlp for
-    // the length of a photo post only wastes a request.
-    if matches!((mode, long_video), (Mode::Video, LongVideo::Ask)) && !is_instagram_post(&url) {
+    // Instagram posts and thread links skip this: Instagram posts are mostly
+    // photos, yt-dlp does not know thread links, and asking it for their
+    // length only wastes a request.
+    if matches!((mode, long_video), (Mode::Video, LongVideo::Ask)) && !prefers_gallery(&url) {
         if let Some(duration) = get_video_duration(&url, config).await {
             if duration > config.long_video_secs {
                 return ask_audio_or_video(bot, msg, target, url, duration, pending).await;
