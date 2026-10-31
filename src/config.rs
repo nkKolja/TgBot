@@ -94,6 +94,10 @@ pub struct Config {
     /// Largest file the Bot API will accept from us. 50 MB on api.telegram.org,
     /// up to 2000 MB against a self-hosted Bot API server.
     pub max_upload_bytes: u64,
+    /// Largest file the Bot API lets us download (videos sent to be
+    /// converted): 20 MB on api.telegram.org, no limit on a self-hosted
+    /// server in --local mode.
+    pub max_download_bytes: u64,
     /// Base URL of a self-hosted Bot API server, if any.
     pub telegram_api_url: Option<String>,
     /// Cookie jar used for any site without a service-specific one.
@@ -112,6 +116,9 @@ pub struct Config {
     /// core, so parallel encodes only make each one slower and risk timeouts.
     pub encode_slots: tokio::sync::Semaphore,
 }
+
+/// What api.telegram.org lets a bot download, in MB.
+pub const BOT_API_DOWNLOAD_MB: u64 = 20;
 
 fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok().and_then(|s| s.trim().parse::<T>().ok())
@@ -132,6 +139,13 @@ impl Config {
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|mb| *mb > 0)
             .unwrap_or(50);
+        let telegram_api_url = std::env::var("TELEGRAM_API_URL").ok().filter(|s| !s.is_empty());
+        // Only a server the bot will actually use lifts the cap (main.rs falls
+        // back to api.telegram.org on a URL it cannot parse). Whether it runs
+        // with --local cannot be told from here; if not, Telegram's refusal
+        // is turned into the same message as the 20 MB check.
+        let own_server = telegram_api_url.as_deref().is_some_and(|u| url::Url::parse(u).is_ok());
+        let max_download_mb = if own_server { 2000 } else { BOT_API_DOWNLOAD_MB };
         Self {
             ytdlp_bin: std::env::var("YTDLP_BIN")
                 .map(PathBuf::from)
@@ -148,7 +162,8 @@ impl Config {
             download_timeout: Duration::from_secs(timeout_secs),
             long_video_secs,
             max_upload_bytes: max_upload_mb * 1024 * 1024,
-            telegram_api_url: std::env::var("TELEGRAM_API_URL").ok().filter(|s| !s.is_empty()),
+            max_download_bytes: max_download_mb * 1024 * 1024,
+            telegram_api_url,
             cookies_file: std::env::var("COOKIES_FILE")
                 .ok()
                 .filter(|s| !s.is_empty())

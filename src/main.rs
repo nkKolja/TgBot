@@ -8,6 +8,7 @@ use teloxide::utils::command::BotCommands;
 use tracing::{debug, error, info, warn};
 
 mod config;
+mod convert;
 mod download;
 mod gallery;
 mod handlers;

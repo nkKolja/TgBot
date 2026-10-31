@@ -143,7 +143,7 @@ async fn video_format(ffprobe: &Path, path: &Path) -> (Option<String>, Option<St
 /// of the playlist formats (HLS, concat) that open further files. Passed as
 /// `-format_whitelist`, it keeps a crafted upload from making ffmpeg read
 /// files off this machine into a video that then gets sent back.
-const VIDEO_DEMUXERS: &str = "mov,matroska,avi,flv,mpegts,mpeg,asf,ogg,rm,ivf,gif";
+pub(crate) const VIDEO_DEMUXERS: &str = "mov,matroska,avi,flv,mpegts,mpeg,asf,ogg,rm,ivf,gif";
 
 /// Make a video Telegram will play inline: H.264 + AAC/MP3 in MP4. Each part
 /// that is already right is copied, so most downloads cost a quick remux or
@@ -216,7 +216,7 @@ pub(crate) async fn telegram_friendly_video(path: &Path, dir: &Path, config: &Co
 /// Keeps "sending video…" showing in the chat while the bot works, which can
 /// take a minute. Telegram clears an action after five seconds, so it is sent
 /// again until the guard is dropped.
-struct ChatActionGuard(tokio::task::JoinHandle<()>);
+pub(crate) struct ChatActionGuard(tokio::task::JoinHandle<()>);
 
 impl Drop for ChatActionGuard {
     fn drop(&mut self) {
@@ -224,7 +224,7 @@ impl Drop for ChatActionGuard {
     }
 }
 
-fn show_chat_action(bot: &Bot, chat: ChatId, action: ChatAction) -> ChatActionGuard {
+pub(crate) fn show_chat_action(bot: &Bot, chat: ChatId, action: ChatAction) -> ChatActionGuard {
     let bot = bot.clone();
     ChatActionGuard(tokio::spawn(async move {
         loop {
@@ -359,7 +359,7 @@ async fn send_audio_file(
 
 /// Build an output path in `dir` named after the title, so desktop Telegram
 /// shows something meaningful instead of `shrunk.m4a`.
-fn titled_path(dir: &Path, title: &str, fallback: &str, ext: &str) -> PathBuf {
+pub(crate) fn titled_path(dir: &Path, title: &str, fallback: &str, ext: &str) -> PathBuf {
     let safe: String = title
         .chars()
         .map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c })
@@ -1231,7 +1231,7 @@ fn gain_for(lufs: f64) -> f64 {
 
 /// For audio that has no louder version to fall back on: the gain to apply
 /// when it is well below normal level, or `None`.
-async fn quiet_boost(path: &Path, config: &Config) -> Option<f64> {
+pub(crate) async fn quiet_boost(path: &Path, config: &Config) -> Option<f64> {
     let lufs = sample_loudness(path, config).await?;
     if lufs >= QUIET_LUFS {
         return None;
@@ -1275,7 +1275,7 @@ async fn download_drc(
 /// Send finished audio: as-is when it fits, re-encoded smaller when it does not,
 /// and split into numbered parts when even that is not enough. `boost_db`, set
 /// only for quiet audio, forces an encode with that gain.
-async fn deliver_audio(
+pub(crate) async fn deliver_audio(
     bot: &Bot,
     target: &Target,
     path: &Path,

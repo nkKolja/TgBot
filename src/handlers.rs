@@ -8,6 +8,7 @@ use teloxide::types::{
 use tracing::{debug, error, info};
 
 use crate::config::Config;
+use crate::convert::{convert_upload, Outcome, Upload};
 use crate::download::{download_and_send_audio, download_and_send_video};
 use crate::helpers::{
     capitalize_first, extract_supported_url, get_video_duration, is_audio_site, prefers_gallery,
@@ -117,26 +118,60 @@ pub async fn handle_message(
     pending: PendingDownloads,
     config: Arc<Config>,
 ) -> ResponseResult<()> {
-    let Some(url) = find_link(&msg) else {
-        debug!("Message without a supported link");
-        if msg.chat.is_private() {
-            let reply = if has_any_link(&msg) {
-                "Тај линк не умем да преузмем. Пошаљи линк до видеа или објаве, \
-                 не до профила или канала."
-                    .to_string()
-            } else {
-                format!(
-                    "{}, баци линк.\n/video за видео\n/audio за само звук",
-                    capitalize_first(random_greeting())
-                )
-            };
-            bot.send_message(msg.chat.id, reply).await?;
-        }
-        return Ok(());
-    };
-
+    let is_private = msg.chat.is_private();
     let mode = modes.get(&sender_id(&msg)).map(|m| *m).unwrap_or_default();
-    process_link(&bot, &msg, url, mode, LongVideo::Ask, &pending, &config).await
+
+    // A link wins over an attached video: a forwarded post often carries
+    // both, and the link is the reason it was sent.
+    if let Some(url) = find_link(&msg) {
+        return process_link(&bot, &msg, url, mode, LongVideo::Ask, &pending, &config).await;
+    }
+
+    // A video file: converting it is the request; there is no command for it.
+    if let Some(upload) = Upload::from_message(&msg).filter(|u| u.wanted(is_private)) {
+        return convert(&bot, &msg, &upload, mode, &config).await;
+    }
+
+    debug!("Message without a supported link");
+    if is_private {
+        let reply = if has_any_link(&msg) {
+            "Тај линк не умем да преузмем. Пошаљи линк до видеа или објаве, \
+             не до профила или канала."
+                .to_string()
+        } else {
+            format!(
+                "{}, баци линк.\n/video за видео\n/audio за само звук",
+                capitalize_first(random_greeting())
+            )
+        };
+        bot.send_message(msg.chat.id, reply).await?;
+    }
+    Ok(())
+}
+
+/// Convert a video someone sent and send it back (or its sound, in audio mode).
+async fn convert(
+    bot: &Bot,
+    msg: &Message,
+    upload: &Upload,
+    mode: Mode,
+    config: &Config,
+) -> ResponseResult<()> {
+    let reply = match convert_upload(bot, Target::of(msg), upload, mode, config).await {
+        Ok(Outcome::Sent) => None,
+        Ok(Outcome::AlreadyPlayable) => {
+            Some("Овај видео већ ради у Телеграму, нема шта да се претвара.".to_string())
+        }
+        Err(e) => {
+            error!("Error converting an uploaded video: {e}");
+            Some(user_facing_error(&e.to_string()))
+        }
+    };
+    // As with links: in groups only the result is posted, never a complaint.
+    if let Some(reply) = reply.filter(|_| msg.chat.is_private()) {
+        bot.send_message(msg.chat.id, reply).await?;
+    }
+    Ok(())
 }
 
 /// Download one link and send what it holds, or first ask about audio when
